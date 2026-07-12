@@ -15,16 +15,19 @@
 //! the page frames *with their page data uncompressed*, the index, and the
 //! trailer's post-apply field — deliberately independent of compression.
 //!
-//! Phase 0 implements the **read path** (the [`Decoder`]); the write path
-//! follows once reads are proven against Litestream-produced fixtures.
+//! Phase 0 implements both the **read path** ([`Decoder`], [`read_snapshot`])
+//! and the **write path** ([`Encoder`], [`write_snapshot`]), each validated for
+//! binary compatibility against the Go `superfly/ltx` tooling.
 
 mod checksum;
 mod decoder;
+mod encoder;
 mod error;
 mod format;
 
 pub use checksum::{CHECKSUM_FLAG, Checksum, Hasher, checksum_page};
 pub use decoder::{Decoder, PageIndexElem, Snapshot, read_snapshot};
+pub use encoder::{Encoder, write_snapshot};
 pub use error::LtxError;
 pub use format::{
     HEADER_FLAG_NO_CHECKSUM, HEADER_SIZE, Header, MAGIC, PAGE_HEADER_FLAG_SIZE, PAGE_HEADER_SIZE,

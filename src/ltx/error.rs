@@ -2,7 +2,7 @@ use core::fmt;
 
 use super::checksum::Checksum;
 
-/// Errors produced while decoding LTX files.
+/// Errors produced while reading or writing LTX files.
 #[derive(Debug)]
 pub enum LtxError {
     /// Underlying I/O failure.
@@ -33,6 +33,18 @@ pub enum LtxError {
     NotASnapshot,
     /// Pages arrived out of the expected snapshot order.
     UnexpectedPage { expected: u32, got: u32 },
+    /// TXID range is invalid (zero or min > max).
+    InvalidTxidRange { min: u64, max: u64 },
+    /// A snapshot header carried a non-zero pre-apply checksum.
+    SnapshotPreApplyChecksum,
+    /// A page was encoded out of ascending order, or before page 1.
+    PageOutOfOrder { prev: u32, pgno: u32 },
+    /// A page number exceeded the header's commit size.
+    PageBeyondCommit { pgno: u32, commit: u32 },
+    /// The lock page was passed to the encoder (it must be skipped).
+    LockPageEncoded(u32),
+    /// A page buffer's length did not match the header page size.
+    WrongPageLength { expected: u32, got: usize },
 }
 
 impl fmt::Display for LtxError {
@@ -64,6 +76,24 @@ impl fmt::Display for LtxError {
             LtxError::NotASnapshot => write!(f, "not a snapshot LTX file"),
             LtxError::UnexpectedPage { expected, got } => {
                 write!(f, "unexpected page: expected pgno {expected}, got {got}")
+            }
+            LtxError::InvalidTxidRange { min, max } => {
+                write!(f, "invalid txid range: ({min}, {max})")
+            }
+            LtxError::SnapshotPreApplyChecksum => {
+                write!(f, "pre-apply checksum must be zero on snapshots")
+            }
+            LtxError::PageOutOfOrder { prev, pgno } => {
+                write!(f, "page out of order: prev {prev}, pgno {pgno}")
+            }
+            LtxError::PageBeyondCommit { pgno, commit } => {
+                write!(f, "page {pgno} out-of-bounds for commit size {commit}")
+            }
+            LtxError::LockPageEncoded(pgno) => {
+                write!(f, "cannot encode lock page: pgno={pgno}")
+            }
+            LtxError::WrongPageLength { expected, got } => {
+                write!(f, "wrong page length: expected {expected}, got {got}")
             }
         }
     }

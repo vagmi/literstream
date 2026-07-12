@@ -119,6 +119,44 @@ impl Header {
     pub fn lock_pgno(&self) -> u32 {
         lock_pgno(self.page_size)
     }
+
+    /// Encodes the header to its 100-byte on-disk form (matching Go's
+    /// `Header.MarshalBinary`). Bytes `80..100` are reserved zeros.
+    pub fn encode(&self) -> [u8; HEADER_SIZE] {
+        let mut b = [0u8; HEADER_SIZE];
+        b[0..4].copy_from_slice(&MAGIC);
+        b[4..8].copy_from_slice(&self.flags.to_be_bytes());
+        b[8..12].copy_from_slice(&self.page_size.to_be_bytes());
+        b[12..16].copy_from_slice(&self.commit.to_be_bytes());
+        b[16..24].copy_from_slice(&self.min_txid.to_be_bytes());
+        b[24..32].copy_from_slice(&self.max_txid.to_be_bytes());
+        b[32..40].copy_from_slice(&self.timestamp.to_be_bytes());
+        b[40..48].copy_from_slice(&self.pre_apply_checksum.0.to_be_bytes());
+        b[48..56].copy_from_slice(&self.wal_offset.to_be_bytes());
+        b[56..64].copy_from_slice(&self.wal_size.to_be_bytes());
+        b[64..68].copy_from_slice(&self.wal_salt1.to_be_bytes());
+        b[68..72].copy_from_slice(&self.wal_salt2.to_be_bytes());
+        b[72..80].copy_from_slice(&self.node_id.to_be_bytes());
+        b
+    }
+
+    /// Validates the header before encoding (mirrors Go's `Header.Validate`).
+    pub fn validate(&self) -> Result<(), LtxError> {
+        if !is_valid_page_size(self.page_size) {
+            return Err(LtxError::InvalidPageSize(self.page_size));
+        }
+        if self.min_txid == 0 || self.max_txid == 0 || self.min_txid > self.max_txid {
+            return Err(LtxError::InvalidTxidRange {
+                min: self.min_txid,
+                max: self.max_txid,
+            });
+        }
+        // Snapshots carry every page and have no previous state to chain from.
+        if self.is_snapshot() && !self.pre_apply_checksum.is_zero() {
+            return Err(LtxError::SnapshotPreApplyChecksum);
+        }
+        Ok(())
+    }
 }
 
 /// The header preceding each page frame (6 bytes on disk).
@@ -152,6 +190,14 @@ impl PageHeader {
     pub fn is_block_compressed(&self) -> bool {
         self.flags & PAGE_HEADER_FLAG_SIZE != 0
     }
+
+    /// Encodes the page header to its 6-byte on-disk form.
+    pub fn encode(&self) -> [u8; PAGE_HEADER_SIZE] {
+        let mut b = [0u8; PAGE_HEADER_SIZE];
+        b[0..4].copy_from_slice(&self.pgno.to_be_bytes());
+        b[4..6].copy_from_slice(&self.flags.to_be_bytes());
+        b
+    }
 }
 
 /// The ending frame of an LTX file (16 bytes on disk).
@@ -176,5 +222,13 @@ impl Trailer {
             post_apply_checksum: Checksum(be_u64(b, 0)),
             file_checksum: Checksum(be_u64(b, 8)),
         })
+    }
+
+    /// Encodes the trailer to its 16-byte on-disk form.
+    pub fn encode(&self) -> [u8; TRAILER_SIZE] {
+        let mut b = [0u8; TRAILER_SIZE];
+        b[0..8].copy_from_slice(&self.post_apply_checksum.0.to_be_bytes());
+        b[8..16].copy_from_slice(&self.file_checksum.0.to_be_bytes());
+        b
     }
 }
