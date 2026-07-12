@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# LZ4 *block* codec (raw blocks, no frame/size prefix) — matches the
+# pierrec/lz4 UncompressBlock/CompressBlock that superfly/ltx uses per page.
+lz4_flex = "0.11"

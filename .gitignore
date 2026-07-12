@@ -1,2 +1,7 @@
 /target
 references
+Cargo.lock
+*.db
+*.ltx
+*wal
+*shm
