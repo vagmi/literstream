@@ -5,3 +5,4 @@
 //! uses for replication. See `plans/implementation.md` for the roadmap.
 
 pub mod ltx;
+pub mod wal;
