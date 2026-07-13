@@ -13,6 +13,10 @@ pub enum WalError {
     InvalidPageSize(u32),
     /// The 32-byte header's own checksum did not verify.
     HeaderChecksumMismatch,
+    /// A start offset was not aligned to a frame boundary.
+    UnalignedOffset(u64),
+    /// The frame before a start offset had mismatched salts (WAL discontinuity).
+    PrevFrameMismatch,
 }
 
 impl fmt::Display for WalError {
@@ -25,6 +29,8 @@ impl fmt::Display for WalError {
             WalError::UnsupportedVersion(v) => write!(f, "unsupported wal version: {v}"),
             WalError::InvalidPageSize(sz) => write!(f, "invalid page size: {sz}"),
             WalError::HeaderChecksumMismatch => write!(f, "wal header checksum mismatch"),
+            WalError::UnalignedOffset(o) => write!(f, "unaligned wal offset: {o}"),
+            WalError::PrevFrameMismatch => write!(f, "previous wal frame mismatch (discontinuity)"),
         }
     }
 }

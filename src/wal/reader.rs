@@ -62,6 +62,47 @@ impl<'a> WalReader<'a> {
         })
     }
 
+    /// Opens a reader positioned at `offset` (a frame boundary), seeding the
+    /// running checksum from the previous frame so incremental reads verify.
+    ///
+    /// `offset` must equal [`WAL_HEADER_SIZE`] + N·frame_size. Errors with
+    /// [`WalError::PrevFrameMismatch`] if the preceding frame's salts don't
+    /// match the header (a discontinuity — the caller should snapshot).
+    pub fn new_at_offset(data: &'a [u8], offset: u64) -> Result<WalReader<'a>, WalError> {
+        let header = WalHeader::parse(data)?;
+        let frame_size = (WAL_FRAME_HEADER_SIZE + header.page_size as usize) as u64;
+        let ho = WAL_HEADER_SIZE as u64;
+        if offset < ho || (offset - ho) % frame_size != 0 {
+            return Err(WalError::UnalignedOffset(offset));
+        }
+        let frame_n = ((offset - ho) / frame_size) as usize;
+
+        let chksum = if frame_n == 0 {
+            (header.checksum1, header.checksum2)
+        } else {
+            let prev = (ho + (frame_n as u64 - 1) * frame_size) as usize;
+            let end = prev + WAL_FRAME_HEADER_SIZE;
+            if end > data.len() {
+                return Err(WalError::Incomplete {
+                    need: end,
+                    got: data.len(),
+                });
+            }
+            let ph = WalFrameHeader::parse(&data[prev..end]);
+            if ph.salt1 != header.salt1 || ph.salt2 != header.salt2 {
+                return Err(WalError::PrevFrameMismatch);
+            }
+            (ph.checksum1, ph.checksum2)
+        };
+
+        Ok(WalReader {
+            data,
+            header,
+            frame_n,
+            chksum,
+        })
+    }
+
     pub fn header(&self) -> &WalHeader {
         &self.header
     }

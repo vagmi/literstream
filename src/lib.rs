@@ -6,4 +6,5 @@
 
 pub mod db;
 pub mod ltx;
+pub mod sync;
 pub mod wal;
