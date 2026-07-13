@@ -4,5 +4,6 @@
 //! is byte-compatible with `github.com/superfly/ltx` v3, the format Litestream
 //! uses for replication. See `plans/implementation.md` for the roadmap.
 
+pub mod db;
 pub mod ltx;
 pub mod wal;

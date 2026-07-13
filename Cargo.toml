@@ -7,3 +7,6 @@ edition = "2024"
 # LZ4 *block* codec (raw blocks, no frame/size prefix) — matches the
 # pierrec/lz4 UncompressBlock/CompressBlock that superfly/ltx uses per page.
 lz4_flex = "0.11"
+# Pinned to 0.35: newer libsqlite3-sys build scripts use the unstable
+# `cfg_select` feature, which this toolchain rejects.
+rusqlite = { version = "0.35", features = ["bundled"] }
