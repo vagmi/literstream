@@ -1,24 +1,21 @@
 //! Streaming LTX writer.
 //!
-//! [`Encoder`] mirrors `github.com/superfly/ltx`'s Go encoder byte-for-byte in
-//! *framing*: header, then per page `[page-header ‖ size ‖ lz4-block]`, then the
-//! zero page-header terminator, the varint page index, and the trailer. The
-//! running CRC64 is fed the header, each page's `[page-header ‖ size ‖
-//! *uncompressed* data]`, the terminator, the index, and the trailer's
-//! post-apply field — so the file checksum is compression-independent.
+//! [`Encoder`] writes the LZ4 **frame** page format that litestream (ltx v0.5.1)
+//! uses: header, then per page `[page-header ‖ lz4-frame]` (no size prefix), then
+//! the zero page-header terminator, the varint page index, and the trailer. The
+//! running CRC64 is fed the header, each page's `[page-header ‖ *uncompressed*
+//! data]`, the terminator, the index, and the trailer's post-apply field — so
+//! the file checksum is compression-independent.
 //!
-//! Our LZ4 output need not be byte-identical to Go's (a different compressor
-//! yields different compressed bytes and thus different file bytes), but any
-//! valid LZ4-block decoder — including Go's — can read it. Binary compatibility
-//! means mutual decodability, not identical bytes.
+//! Our LZ4 output need not be byte-identical to Go's; binary compatibility means
+//! mutual decodability, not identical bytes. Sync-engine files additionally set
+//! `HeaderFlagNoChecksum` (post-apply = 0), which litestream's restore requires.
 
 use std::io::Write;
 
 use super::checksum::{CHECKSUM_FLAG, Checksum, Hasher, checksum_page};
 use super::error::LtxError;
-use super::format::{
-    Header, PAGE_HEADER_FLAG_SIZE, PAGE_HEADER_SIZE, PageHeader, TRAILER_SIZE, Trailer, lock_pgno,
-};
+use super::format::{Header, PAGE_HEADER_SIZE, PageHeader, TRAILER_SIZE, Trailer, lock_pgno};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum State {
@@ -136,18 +133,22 @@ impl<W: Write> Encoder<W> {
 
         let offset = self.n;
 
-        // LZ4 *block* compression (raw block, no size prefix) — the inverse of
-        // the reader's `decompress_into`.
-        let compressed = lz4_flex::block::compress(data);
+        // LZ4 *frame* format (flags = 0, no size prefix) — this is what
+        // litestream (ltx v0.5.1) emits, so its decoder can read our files. Any
+        // valid LZ4-frame decoder (Go's pierrec, ltx HEAD) reads it too.
+        let mut compressed = Vec::new();
+        {
+            let mut fenc = lz4_flex::frame::FrameEncoder::new(&mut compressed);
+            fenc.write_all(data)?;
+            fenc.finish()
+                .map_err(|e| LtxError::Io(std::io::Error::other(e)))?;
+        }
 
-        let ph = PageHeader {
-            pgno,
-            flags: PAGE_HEADER_FLAG_SIZE,
-        };
+        let ph = PageHeader { pgno, flags: 0 };
         self.write_hashed(&ph.encode())?;
-        self.write_hashed(&(compressed.len() as u32).to_be_bytes())?;
 
-        // Compressed bytes go to disk only; the checksum sees uncompressed data.
+        // Compressed frame goes to disk only; the checksum sees uncompressed
+        // data. No size field is written in the frame format.
         self.w.write_all(&compressed)?;
         self.n += compressed.len() as u64;
         self.hash.update(data);

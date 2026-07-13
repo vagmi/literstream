@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use literstream::db::{CheckpointMode, Db};
 use literstream::storage::ReplicaClient;
-use literstream::sync::{SyncError, SyncOutcome, Syncer, restore};
+use literstream::sync::{
+    ReplicaReader, SyncError, SyncOutcome, Syncer, restore, restore_to_timestamp, restore_to_txid,
+};
 use object_store::memory::InMemory;
 use rusqlite::Connection;
 
@@ -209,7 +211,11 @@ async fn compaction_bounds_the_chain_and_restore_still_works() {
     // Compact: fold L0[1..4] into an L1 base, keep the newest L0 (txid 5).
     let info = syncer.compact().await.unwrap().unwrap();
     assert_eq!((info.min_txid, info.max_txid), (1, 4));
-    assert_eq!(client.list_ltx(1).await.unwrap().len(), 1, "one L1 base");
+    assert_eq!(
+        client.list_ltx(9).await.unwrap().len(),
+        1,
+        "one snapshot base"
+    );
     assert_eq!(
         client.list_ltx(0).await.unwrap().len(),
         1,
@@ -265,6 +271,97 @@ async fn resumes_across_levels_after_compaction() {
     let (integrity, count) = validate_image(&tc.dir, &image);
     assert_eq!(integrity, "ok");
     assert_eq!(count, 100);
+}
+
+#[tokio::test]
+async fn direct_page_reads_match_full_restore() {
+    let tc = TempCase::new("pageread");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+    for b in 0..4 {
+        insert_range(&w, b * 30 + 1, b * 30 + 31, "b");
+        syncer.sync().await.unwrap();
+    }
+    syncer.compact().await.unwrap().unwrap();
+
+    let full = restore(&client).await.unwrap();
+    let ps = 4096usize;
+    let n_pages = full.len() / ps;
+    assert!(n_pages >= 2);
+
+    // Read every page directly via the page index + ranged GETs.
+    let mut reader = ReplicaReader::open(&client, None).await.unwrap();
+    assert_eq!(reader.page_size(), 4096);
+    for pgno in 1..=n_pages as u32 {
+        let page = reader
+            .read_page(pgno)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("page {pgno} should exist"));
+        let start = (pgno as usize - 1) * ps;
+        assert_eq!(
+            &page[..],
+            &full[start..start + ps],
+            "page {pgno} differs from full restore"
+        );
+    }
+    // A page past the database doesn't exist.
+    assert!(
+        reader
+            .read_page(n_pages as u32 + 50)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn point_in_time_restore_by_txid_and_timestamp() {
+    let tc = TempCase::new("pitr");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+
+    // txid 1..4, cumulative 10/20/30/40 rows.
+    for b in 0..4 {
+        insert_range(&w, b * 10 + 1, b * 10 + 11, "b");
+        syncer.sync().await.unwrap();
+    }
+
+    // Restore to an earlier transaction.
+    let r = restore_to_txid(&client, 2).await.unwrap();
+    assert_eq!(r.txid, 2);
+    assert_eq!(validate_image(&tc.dir, &r.image), ("ok".into(), 20));
+
+    // A future TXID snaps to the latest.
+    assert_eq!(restore_to_txid(&client, 99).await.unwrap().txid, 4);
+
+    // Timestamp bounds: far-future -> latest, epoch 0 -> nothing retained.
+    assert_eq!(
+        restore_to_timestamp(&client, i64::MAX).await.unwrap().txid,
+        4
+    );
+    assert!(matches!(
+        restore_to_timestamp(&client, 0).await,
+        Err(SyncError::TxidTooOld { .. })
+    ));
+
+    // After compaction (L1[1..3] base), pre-3 points are gone; 3 is the base.
+    syncer.compact().await.unwrap().unwrap();
+    assert!(matches!(
+        restore_to_txid(&client, 2).await,
+        Err(SyncError::TxidTooOld { .. })
+    ));
+    let r = restore_to_txid(&client, 3).await.unwrap();
+    assert_eq!(r.txid, 3);
+    assert_eq!(validate_image(&tc.dir, &r.image), ("ok".into(), 30));
 }
 
 #[tokio::test]

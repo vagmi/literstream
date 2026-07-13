@@ -139,6 +139,31 @@ impl ReplicaClient {
         Ok(result.bytes().await?)
     }
 
+    /// Downloads `len` bytes starting at `offset` of an LTX object (a ranged
+    /// GET) — used to read just a header, page index, or single page frame.
+    pub async fn get_ltx_range(
+        &self,
+        level: u32,
+        min_txid: u64,
+        max_txid: u64,
+        offset: u64,
+        len: u64,
+    ) -> Result<Bytes, StorageError> {
+        let key = self.ltx_key(level, min_txid, max_txid);
+        Ok(self.store.get_range(&key, offset..offset + len).await?)
+    }
+
+    /// The byte size of an LTX object (a HEAD request).
+    pub async fn ltx_size(
+        &self,
+        level: u32,
+        min_txid: u64,
+        max_txid: u64,
+    ) -> Result<u64, StorageError> {
+        let key = self.ltx_key(level, min_txid, max_txid);
+        Ok(self.store.head(&key).await?.size)
+    }
+
     /// Deletes an LTX object.
     pub async fn delete_ltx(
         &self,

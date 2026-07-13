@@ -13,8 +13,9 @@
 //!
 //! Model (as litestream): each sync = one L0 file at `TXID = prev+1`
 //! (`MinTXID == MaxTXID`); the first sync writes a `MinTXID=1` snapshot, later
-//! syncs only the changed pages. We maintain the real rolling database checksum
-//! (see the crate docs) so the standard `ltx apply` can replay our chain.
+//! syncs only the changed pages. Files carry `HeaderFlagNoChecksum` and LZ4
+//! *frame*-compressed pages — matching litestream (ltx v0.5.1) exactly, so the
+//! real litestream binary restores our replicas and we restore its.
 
 use std::fs;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -24,13 +25,16 @@ use bytes::Bytes;
 use crate::db::{CheckpointMode, CheckpointResult, Db};
 use crate::lock::ProcessLock;
 use crate::ltx::{
-    CHECKSUM_FLAG, Checksum, Decoder, Encoder, Header, checksum_page, compact, lock_pgno,
+    Checksum, Decoder, Encoder, HEADER_FLAG_NO_CHECKSUM, HEADER_SIZE, Header, compact, lock_pgno,
+    read_file,
 };
 use crate::storage::{PutOutcome, ReplicaClient};
 use crate::wal::{PageMap, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalHeader, WalReader};
 
 mod error;
+mod reader;
 pub use error::SyncError;
+pub use reader::ReplicaReader;
 
 /// Default WAL-frame threshold for a PASSIVE checkpoint (~4 MB @ 4 KB).
 pub const DEFAULT_MIN_CHECKPOINT_FRAMES: u64 = 1000;
@@ -39,10 +43,12 @@ pub const DEFAULT_TRUNCATE_FRAMES: u64 = 10_000;
 
 /// L0 is the raw, uncompacted level.
 const LEVEL0: u32 = 0;
-/// L1 holds the single compacted base (a merged snapshot).
-const LEVEL1: u32 = 1;
-/// Highest level scanned during restore/resume (we currently produce L0 & L1).
-const MAX_LEVEL: u32 = 1;
+/// Level 9 holds full snapshots (matches litestream's `SnapshotLevel`), where we
+/// write the compacted base so litestream's restore can use it as the base.
+const SNAPSHOT_LEVEL: u32 = 9;
+/// Highest level scanned during restore/resume — covers litestream's levels 0–8
+/// plus the snapshot level 9.
+const MAX_LEVEL: u32 = 9;
 
 /// What a [`Syncer::compact`] produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -91,8 +97,6 @@ struct BuiltFile {
     max_txid: u64,
     bytes: Vec<u8>,
     new_pos: Position,
-    new_page_checksums: Vec<Checksum>,
-    new_post_apply: Checksum,
 }
 
 /// Replicates a [`Db`]'s WAL to an object-store replica.
@@ -100,8 +104,6 @@ pub struct Syncer {
     db: Db,
     client: ReplicaClient,
     pos: Position,
-    page_checksums: Vec<Checksum>,
-    post_apply: Checksum,
     /// Held for the syncer's lifetime to enforce a single host-local writer.
     _lock: ProcessLock,
     /// PASSIVE checkpoint when the WAL reaches this many frames.
@@ -118,18 +120,10 @@ impl Syncer {
     pub async fn open(db: Db, client: ReplicaClient) -> Result<Syncer, SyncError> {
         let lock = ProcessLock::acquire(db.path())?;
         let pos = derive_position(&client).await?;
-        let (page_checksums, post_apply) = if pos.txid > 0 {
-            let image = restore(&client).await?;
-            checksums_from_image(&image, db.page_size() as usize)
-        } else {
-            (Vec::new(), Checksum::ZERO)
-        };
         Ok(Syncer {
             db,
             client,
             pos,
-            page_checksums,
-            post_apply,
             _lock: lock,
             min_checkpoint_frames: DEFAULT_MIN_CHECKPOINT_FRAMES,
             truncate_frames: DEFAULT_TRUNCATE_FRAMES,
@@ -181,8 +175,6 @@ impl Syncer {
         }
 
         self.pos = b.new_pos;
-        self.page_checksums = b.new_page_checksums;
-        self.post_apply = b.new_post_apply;
         Ok(b.outcome)
     }
 
@@ -266,32 +258,18 @@ impl Syncer {
         let txid = self.pos.txid + 1;
         let lock = lock_pgno(page_size as u32);
 
-        let pre_apply = if txid == 1 {
-            Checksum::ZERO
-        } else {
-            self.post_apply
-        };
-
-        let mut page_checksums = vec![Checksum::ZERO; commit as usize];
-        let mut post = Checksum::ZERO;
         let mut buf = Vec::new();
         {
             let mut enc = Encoder::new(&mut buf);
-            enc.encode_header(Header {
-                flags: 0,
-                page_size: page_size as u32,
+            enc.encode_header(no_checksum_header(
+                page_size as u32,
                 commit,
-                min_txid: txid,
-                max_txid: txid,
-                timestamp: now_ms(),
-                pre_apply_checksum: pre_apply,
-                wal_offset: offset as i64,
-                wal_size: wal_size as i64,
-                wal_salt1: salt1,
-                wal_salt2: salt2,
-                node_id: 0,
-            })?;
-
+                txid,
+                offset,
+                wal_size,
+                salt1,
+                salt2,
+            ))?;
             for pgno in 1..=commit {
                 if pgno == lock {
                     continue;
@@ -304,11 +282,7 @@ impl Syncer {
                     }
                 };
                 enc.encode_page(pgno, data)?;
-                let cp = checksum_page(pgno, data);
-                page_checksums[pgno as usize - 1] = cp;
-                post = Checksum(CHECKSUM_FLAG | (post.0 ^ cp.0));
             }
-            enc.set_post_apply_checksum(post);
             enc.finish()?;
         }
 
@@ -327,8 +301,6 @@ impl Syncer {
                 salt2,
                 synced_to_wal_end: offset + wal_size == wal.len() as u64,
             },
-            new_page_checksums: page_checksums,
-            new_post_apply: post,
         })
     }
 
@@ -348,52 +320,27 @@ impl Syncer {
         let wal_size = page_map.end_offset - offset;
         let commit = page_map.commit;
         let txid = self.pos.txid + 1;
-        let pre_apply = self.post_apply;
 
         let mut pgnos: Vec<u32> = page_map.pages.keys().copied().collect();
         pgnos.sort_unstable();
 
-        let mut checksums = self.page_checksums.clone();
-        if checksums.len() < commit as usize {
-            checksums.resize(commit as usize, Checksum::ZERO);
-        }
-        let mut post = pre_apply;
-
         let mut buf = Vec::new();
         {
             let mut enc = Encoder::new(&mut buf);
-            enc.encode_header(Header {
-                flags: 0,
-                page_size: page_size as u32,
+            enc.encode_header(no_checksum_header(
+                page_size as u32,
                 commit,
-                min_txid: txid,
-                max_txid: txid,
-                timestamp: now_ms(),
-                pre_apply_checksum: pre_apply,
-                wal_offset: offset as i64,
-                wal_size: wal_size as i64,
-                wal_salt1: salt1,
-                wal_salt2: salt2,
-                node_id: 0,
-            })?;
+                txid,
+                offset,
+                wal_size,
+                salt1,
+                salt2,
+            ))?;
             for &pgno in &pgnos {
                 let data = wal_page(wal, page_map.pages[&pgno], page_size);
                 enc.encode_page(pgno, data)?;
-                let cp_new = checksum_page(pgno, data);
-                let idx = pgno as usize - 1;
-                post = Checksum(CHECKSUM_FLAG | (post.0 ^ checksums[idx].0 ^ cp_new.0));
-                checksums[idx] = cp_new;
             }
-            enc.set_post_apply_checksum(post);
             enc.finish()?;
-        }
-
-        // VACUUM shrink: drop removed pages' contributions.
-        if (commit as usize) < checksums.len() {
-            for cp in &checksums[commit as usize..] {
-                post = Checksum(CHECKSUM_FLAG | (post.0 ^ cp.0));
-            }
-            checksums.truncate(commit as usize);
         }
 
         let final_offset = offset + wal_size;
@@ -412,8 +359,6 @@ impl Syncer {
                 salt2,
                 synced_to_wal_end: final_offset == wal.len() as u64,
             },
-            new_page_checksums: checksums,
-            new_post_apply: post,
         }))
     }
 
@@ -442,7 +387,7 @@ impl Syncer {
     /// compacting (fewer than two uncompacted L0 files).
     pub async fn compact(&self) -> Result<Option<CompactionInfo>, SyncError> {
         let l0 = self.client.list_ltx(LEVEL0).await?;
-        let l1 = self.client.list_ltx(LEVEL1).await?;
+        let l1 = self.client.list_ltx(SNAPSHOT_LEVEL).await?;
 
         let base = l1.iter().find(|f| f.min_txid == 1).copied();
         let base_max = base.map(|f| f.max_txid).unwrap_or(0);
@@ -462,7 +407,10 @@ impl Syncer {
         // Fetch inputs in TXID order: the existing base, then the L0 run.
         let mut buffers: Vec<Vec<u8>> = Vec::new();
         if let Some(b) = base {
-            let bytes = self.client.get_ltx(LEVEL1, b.min_txid, b.max_txid).await?;
+            let bytes = self
+                .client
+                .get_ltx(SNAPSHOT_LEVEL, b.min_txid, b.max_txid)
+                .await?;
             buffers.push(bytes.to_vec());
         }
         for f in to_merge {
@@ -476,12 +424,12 @@ impl Syncer {
 
         // Publish the new base, then delete what it supersedes.
         self.client
-            .put_ltx(LEVEL1, 1, new_max, Bytes::from(merged))
+            .put_ltx(SNAPSHOT_LEVEL, 1, new_max, Bytes::from(merged))
             .await?;
         let mut pruned = 0;
         if let Some(b) = base {
             self.client
-                .delete_ltx(LEVEL1, b.min_txid, b.max_txid)
+                .delete_ltx(SNAPSHOT_LEVEL, b.min_txid, b.max_txid)
                 .await?;
             pruned += 1;
         }
@@ -513,17 +461,34 @@ fn wal_page(wal: &[u8], frame_offset: u64, page_size: usize) -> &[u8] {
     &wal[start..start + page_size]
 }
 
-fn checksums_from_image(image: &[u8], page_size: usize) -> (Vec<Checksum>, Checksum) {
-    let n = image.len() / page_size;
-    let mut v = Vec::with_capacity(n);
-    let mut post = Checksum::ZERO;
-    for pgno in 1..=n {
-        let data = &image[(pgno - 1) * page_size..pgno * page_size];
-        let cp = checksum_page(pgno as u32, data);
-        v.push(cp);
-        post = Checksum(CHECKSUM_FLAG | (post.0 ^ cp.0));
+/// A litestream-compatible LTX header: checksum tracking disabled
+/// (`HeaderFlagNoChecksum`, pre-apply = 0). litestream restore rejects files
+/// that carry a rolling checksum, so we omit it — the WAL frame checksums and
+/// the LTX file checksum still protect integrity.
+#[allow(clippy::too_many_arguments)]
+fn no_checksum_header(
+    page_size: u32,
+    commit: u32,
+    txid: u64,
+    wal_offset: u64,
+    wal_size: u64,
+    salt1: u32,
+    salt2: u32,
+) -> Header {
+    Header {
+        flags: HEADER_FLAG_NO_CHECKSUM,
+        page_size,
+        commit,
+        min_txid: txid,
+        max_txid: txid,
+        timestamp: now_ms(),
+        pre_apply_checksum: Checksum::ZERO,
+        wal_offset: wal_offset as i64,
+        wal_size: wal_size as i64,
+        wal_salt1: salt1,
+        wal_salt2: salt2,
+        node_id: 0,
     }
-    (v, post)
 }
 
 /// Lists every LTX file across all levels as `(level, min_txid, max_txid)`.
@@ -576,28 +541,91 @@ fn plan_restore(files: &[(u32, u64, u64)]) -> Result<Vec<(u32, u64, u64)>, SyncE
     Ok(plan)
 }
 
-/// Reconstructs the database image from a replica's LTX chain, using compacted
-/// levels where available and applying incrementals in TXID order.
+/// A point-in-time restore result: the database image and the TXID it reflects
+/// (which may be earlier than requested if the exact point was compacted away).
+#[derive(Clone, Debug)]
+pub struct RestoreResult {
+    pub image: Vec<u8>,
+    pub txid: u64,
+}
+
+/// Applies a plan (files in TXID order) into a database image.
+async fn apply_plan(
+    client: &ReplicaClient,
+    plan: &[(u32, u64, u64)],
+) -> Result<Vec<u8>, SyncError> {
+    let mut image: Vec<u8> = Vec::new();
+    for &(level, min, max) in plan {
+        let bytes = client.get_ltx(level, min, max).await?;
+        let file = read_file(&bytes)?;
+        let page_size = file.header.page_size as usize;
+
+        image.resize(file.header.commit as usize * page_size, 0);
+        for (pgno, data) in file.pages {
+            let start = (pgno as usize - 1) * page_size;
+            image[start..start + page_size].copy_from_slice(&data);
+        }
+    }
+    Ok(image)
+}
+
+/// Reconstructs the latest database image from a replica's LTX chain.
 pub async fn restore(client: &ReplicaClient) -> Result<Vec<u8>, SyncError> {
     let files = list_all_levels(client).await?;
     let plan = plan_restore(&files)?;
+    apply_plan(client, &plan).await
+}
 
-    let mut image: Vec<u8> = Vec::new();
-    for (level, min, max) in plan {
-        let bytes = client.get_ltx(level, min, max).await?;
-        let mut dec = Decoder::new(&bytes[..]);
-        let header = dec.decode_header()?;
-        let page_size = header.page_size as usize;
+/// Restores the database as of `target_txid` (point-in-time recovery).
+///
+/// Applies every plan file whose range ends at or before `target_txid`. The
+/// result reflects the largest such boundary; if `target_txid` predates the
+/// oldest retained file (e.g. compacted away), returns [`SyncError::TxidTooOld`].
+pub async fn restore_to_txid(
+    client: &ReplicaClient,
+    target_txid: u64,
+) -> Result<RestoreResult, SyncError> {
+    let files = list_all_levels(client).await?;
+    let plan = plan_restore(&files)?;
 
-        image.resize(header.commit as usize * page_size, 0);
+    let selected: Vec<(u32, u64, u64)> = plan
+        .into_iter()
+        .take_while(|(_, _, max)| *max <= target_txid)
+        .collect();
+    let Some(&(_, _, txid)) = selected.last() else {
+        return Err(SyncError::TxidTooOld {
+            requested: target_txid,
+        });
+    };
 
-        let mut page = vec![0u8; page_size];
-        while let Some(ph) = dec.decode_page(&mut page)? {
-            let start = (ph.pgno as usize - 1) * page_size;
-            image[start..start + page_size].copy_from_slice(&page);
+    let image = apply_plan(client, &selected).await?;
+    Ok(RestoreResult { image, txid })
+}
+
+/// Restores the database as of `timestamp_ms` (milliseconds since the Unix
+/// epoch), snapping to the newest transaction committed at or before it.
+pub async fn restore_to_timestamp(
+    client: &ReplicaClient,
+    timestamp_ms: i64,
+) -> Result<RestoreResult, SyncError> {
+    let files = list_all_levels(client).await?;
+    let plan = plan_restore(&files)?;
+
+    // Plan files are TXID-ordered and their timestamps are monotonic.
+    let mut target_txid = 0;
+    for &(level, min, max) in &plan {
+        let head = client
+            .get_ltx_range(level, min, max, 0, HEADER_SIZE as u64)
+            .await?;
+        let header = Header::decode(&head)?;
+        if header.timestamp <= timestamp_ms {
+            target_txid = max;
+        } else {
+            break;
         }
-        dec.finish()?;
     }
-
-    Ok(image)
+    if target_txid == 0 {
+        return Err(SyncError::TxidTooOld { requested: 0 });
+    }
+    restore_to_txid(client, target_txid).await
 }

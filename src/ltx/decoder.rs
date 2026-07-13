@@ -185,9 +185,99 @@ impl<R: Read> Decoder<R> {
     }
 }
 
+/// Byte size of the trailing framing after the page index: the u64 index-size
+/// field (8) plus the trailer (16). A ranged reader reads these last 24 bytes to
+/// locate the page index within a file.
+pub const INDEX_FOOTER_SIZE: u64 = 8 + super::format::TRAILER_SIZE as u64;
+
+/// Decodes a single page frame (as located by a [`PageIndexElem`]) into its page
+/// header and `page_size` bytes of data.
+pub fn decode_page_frame(
+    frame: &[u8],
+    page_size: usize,
+) -> Result<(PageHeader, Vec<u8>), LtxError> {
+    let ph = PageHeader::decode(frame)?;
+    if ph.is_zero() {
+        return Err(LtxError::ZeroPageNumber);
+    }
+    let off = super::format::PAGE_HEADER_SIZE;
+    let mut data = vec![0u8; page_size];
+    if ph.is_block_compressed() {
+        // New block format (ltx HEAD): 4-byte size then a raw LZ4 block.
+        if frame.len() < off + 4 {
+            return Err(LtxError::ShortBuffer {
+                need: off + 4,
+                got: frame.len(),
+            });
+        }
+        let n = u32::from_be_bytes(frame[off..off + 4].try_into().unwrap()) as usize;
+        let compressed = &frame[off + 4..off + 4 + n];
+        lz4_flex::block::decompress_into(compressed, &mut data)?;
+    } else {
+        // Old frame format (litestream / ltx v0.5.1): the body is one LZ4 frame.
+        let mut fdec = lz4_flex::frame::FrameDecoder::new(&frame[off..]);
+        fdec.read_exact(&mut data)
+            .map_err(|_| LtxError::FrameFormatUnsupported)?;
+    }
+    Ok((ph, data))
+}
+
+/// A fully-decoded LTX file: header, pages (sorted by page number), and trailer.
+pub struct DecodedFile {
+    pub header: Header,
+    pub pages: Vec<(u32, Vec<u8>)>,
+    pub trailer: Trailer,
+}
+
+/// Decodes an entire LTX file from memory using its page index, so it handles
+/// **both** the LZ4 block format (ltx HEAD) and the LZ4 frame format
+/// (litestream / ltx v0.5.1). Unlike the streaming [`Decoder`], the index gives
+/// each page frame's exact byte range, so the variable-length frame format
+/// decodes without ambiguity.
+pub fn read_file(bytes: &[u8]) -> Result<DecodedFile, LtxError> {
+    let header = Header::decode(bytes)?;
+    let page_size = header.page_size as usize;
+
+    let footer = INDEX_FOOTER_SIZE as usize;
+    if bytes.len() < HEADER_SIZE + footer {
+        return Err(LtxError::ShortBuffer {
+            need: HEADER_SIZE + footer,
+            got: bytes.len(),
+        });
+    }
+    let index_size_at = bytes.len() - footer;
+    let index_len =
+        u64::from_be_bytes(bytes[index_size_at..index_size_at + 8].try_into().unwrap()) as usize;
+    let index_start = index_size_at - index_len;
+
+    let index = decode_page_index(&bytes[index_start..index_size_at])?;
+    let trailer = Trailer::decode(&bytes[bytes.len() - super::format::TRAILER_SIZE..])?;
+
+    let mut pages = Vec::with_capacity(index.len());
+    for elem in &index {
+        let start = elem.offset as usize;
+        let end = start + elem.size as usize;
+        if end > bytes.len() {
+            return Err(LtxError::ShortBuffer {
+                need: end,
+                got: bytes.len(),
+            });
+        }
+        let (ph, data) = decode_page_frame(&bytes[start..end], page_size)?;
+        pages.push((ph.pgno, data));
+    }
+    pages.sort_by_key(|(pgno, _)| *pgno);
+
+    Ok(DecodedFile {
+        header,
+        pages,
+        trailer,
+    })
+}
+
 /// Parses the page index: `varint(pgno, offset, size)...` up to a `varint(0)`
 /// end marker. (The trailing u64 index-size is not needed here.)
-fn decode_page_index(mut b: &[u8]) -> Result<Vec<PageIndexElem>, LtxError> {
+pub fn decode_page_index(mut b: &[u8]) -> Result<Vec<PageIndexElem>, LtxError> {
     let mut out = Vec::new();
     loop {
         let pgno = read_uvarint(&mut b)?;

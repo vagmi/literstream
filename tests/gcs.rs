@@ -17,7 +17,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use literstream::db::Db;
 use literstream::storage::{PutOutcome, ReplicaClient};
-use literstream::sync::{SyncOutcome, Syncer, restore};
+use literstream::sync::{ReplicaReader, SyncOutcome, Syncer, restore, restore_to_txid};
 use object_store::gcp::GoogleCloudStorageBuilder;
 use rusqlite::Connection;
 
@@ -131,6 +131,23 @@ async fn replicate_and_restore_over_gcs() {
     assert_eq!(integrity, "ok");
     assert_eq!(count, 150);
 
+    // Point-in-time restore to the first transaction (50 rows).
+    let pit = restore_to_txid(&client, 1).await.unwrap();
+    assert_eq!(pit.txid, 1);
+
+    // Direct page reads via ranged GETs (proves get_range/head work on GCS).
+    let ps = 4096usize;
+    let mut reader = ReplicaReader::open(&client, None).await.unwrap();
+    for pgno in 1..=(image.len() / ps) as u32 {
+        let page = reader.read_page(pgno).await.unwrap().expect("page exists");
+        let start = (pgno as usize - 1) * ps;
+        assert_eq!(
+            &page[..],
+            &image[start..start + ps],
+            "gcs page {pgno} differs"
+        );
+    }
+
     let _ = std::fs::remove_dir_all(&dir);
-    println!("gcs round-trip ok: 150 rows");
+    println!("gcs round-trip + PITR + direct page reads ok: 150 rows");
 }

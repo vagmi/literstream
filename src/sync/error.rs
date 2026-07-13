@@ -23,6 +23,10 @@ pub enum SyncError {
     Equivocation {
         txid: u64,
     },
+    /// The requested point-in-time is older than the oldest retained file.
+    TxidTooOld {
+        requested: u64,
+    },
 }
 
 impl fmt::Display for SyncError {
@@ -41,6 +45,9 @@ impl fmt::Display for SyncError {
                     f,
                     "equivocation: another writer wrote a different LTX at txid {txid}"
                 )
+            }
+            SyncError::TxidTooOld { requested } => {
+                write!(f, "txid {requested} is older than the oldest retained file")
             }
         }
     }

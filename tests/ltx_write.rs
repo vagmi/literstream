@@ -2,16 +2,30 @@
 //! database, and its checksums must be self-consistent. The compression-
 //! independent post-apply checksum must equal the value Go computes for the
 //! same database (golden from `ltx dump`).
+//!
+//! Our encoder writes LZ4 *frame* format (litestream-compatible), so we decode
+//! via the index-based `read_file` (which handles frame and block).
 
 use std::fs;
 use std::path::PathBuf;
 
-use literstream::ltx::{Decoder, read_snapshot, write_snapshot};
+use literstream::ltx::{DecodedFile, read_file, write_snapshot};
 
 fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures")
         .join(name)
+}
+
+/// Reconstructs the database image from a decoded snapshot.
+fn db_image(file: &DecodedFile) -> Vec<u8> {
+    let ps = file.header.page_size as usize;
+    let mut img = vec![0u8; file.header.commit as usize * ps];
+    for (pgno, data) in &file.pages {
+        let start = (*pgno as usize - 1) * ps;
+        img[start..start + ps].copy_from_slice(data);
+    }
+    img
 }
 
 #[test]
@@ -27,11 +41,9 @@ fn encode_then_decode_reproduces_database() {
         "9bb96fd3473e99f6"
     );
 
-    // Our own decoder verifies the file checksum on the way through (finish()),
-    // and the reconstructed image must be byte-identical to the source DB.
-    let snap = read_snapshot(&out[..]).expect("decode our own output");
-    assert_eq!(snap.db, db, "round-tripped database differs");
-    assert_eq!(snap.trailer.file_checksum, trailer.file_checksum);
+    let file = read_file(&out).expect("decode our own output");
+    assert_eq!(db_image(&file), db, "round-tripped database differs");
+    assert_eq!(file.trailer.file_checksum, trailer.file_checksum);
 }
 
 #[test]
@@ -46,9 +58,9 @@ fn synthetic_pages_round_trip() {
     let mut out = Vec::new();
     write_snapshot(&mut out, page_size as u32, &db, 1, 0).expect("encode");
 
-    let snap = read_snapshot(&out[..]).expect("decode");
-    assert_eq!(snap.header.commit, 2);
-    assert_eq!(snap.db, db);
+    let file = read_file(&out).expect("decode");
+    assert_eq!(file.header.commit, 2);
+    assert_eq!(db_image(&file), db);
 }
 
 #[test]
@@ -97,14 +109,7 @@ fn streaming_encode_matches_helper() {
 
     assert_eq!(manual, helper, "streaming and helper encoders diverged");
 
-    // And make sure the streaming decoder walks the whole thing cleanly.
-    let mut dec = Decoder::new(&manual[..]);
-    dec.decode_header().unwrap();
-    let mut buf = vec![0u8; page_size as usize];
-    let mut n = 0;
-    while dec.decode_page(&mut buf).unwrap().is_some() {
-        n += 1;
-    }
-    dec.finish().unwrap();
-    assert_eq!(n, commit);
+    // The output decodes cleanly with the full page count.
+    let file = read_file(&manual).unwrap();
+    assert_eq!(file.pages.len() as u32, commit);
 }
