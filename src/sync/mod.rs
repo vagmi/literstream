@@ -23,7 +23,9 @@ use bytes::Bytes;
 
 use crate::db::{CheckpointMode, CheckpointResult, Db};
 use crate::lock::ProcessLock;
-use crate::ltx::{CHECKSUM_FLAG, Checksum, Decoder, Encoder, Header, checksum_page, lock_pgno};
+use crate::ltx::{
+    CHECKSUM_FLAG, Checksum, Decoder, Encoder, Header, checksum_page, compact, lock_pgno,
+};
 use crate::storage::{PutOutcome, ReplicaClient};
 use crate::wal::{PageMap, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalHeader, WalReader};
 
@@ -37,6 +39,22 @@ pub const DEFAULT_TRUNCATE_FRAMES: u64 = 10_000;
 
 /// L0 is the raw, uncompacted level.
 const LEVEL0: u32 = 0;
+/// L1 holds the single compacted base (a merged snapshot).
+const LEVEL1: u32 = 1;
+/// Highest level scanned during restore/resume (we currently produce L0 & L1).
+const MAX_LEVEL: u32 = 1;
+
+/// What a [`Syncer::compact`] produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactionInfo {
+    /// New compacted base TXID range (`1..=max_txid`).
+    pub min_txid: u64,
+    pub max_txid: u64,
+    /// Number of input files merged.
+    pub inputs: usize,
+    /// Number of superseded files deleted.
+    pub pruned: usize,
+}
 
 /// What a single [`Syncer::sync`] produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,6 +432,73 @@ impl Syncer {
         };
         Ok(Some((mode, self.db.checkpoint(mode)?)))
     }
+
+    /// Compacts the L0 chain into a single L1 base, pruning the merged files —
+    /// bounding storage and restore length.
+    ///
+    /// The newest L0 file is deliberately *kept* uncompacted: compaction zeroes
+    /// the WAL offset/salts, and that most recent file is what a restart reads to
+    /// recover the WAL resume position. Returns `None` if there's nothing worth
+    /// compacting (fewer than two uncompacted L0 files).
+    pub async fn compact(&self) -> Result<Option<CompactionInfo>, SyncError> {
+        let l0 = self.client.list_ltx(LEVEL0).await?;
+        let l1 = self.client.list_ltx(LEVEL1).await?;
+
+        let base = l1.iter().find(|f| f.min_txid == 1).copied();
+        let base_max = base.map(|f| f.max_txid).unwrap_or(0);
+
+        // L0 files not yet folded into the base, oldest-first; keep the newest.
+        let new_l0: Vec<_> = l0
+            .iter()
+            .filter(|f| f.min_txid > base_max)
+            .copied()
+            .collect();
+        if new_l0.len() < 2 {
+            return Ok(None);
+        }
+        let to_merge = &new_l0[..new_l0.len() - 1];
+        let new_max = to_merge.last().unwrap().max_txid;
+
+        // Fetch inputs in TXID order: the existing base, then the L0 run.
+        let mut buffers: Vec<Vec<u8>> = Vec::new();
+        if let Some(b) = base {
+            let bytes = self.client.get_ltx(LEVEL1, b.min_txid, b.max_txid).await?;
+            buffers.push(bytes.to_vec());
+        }
+        for f in to_merge {
+            let bytes = self.client.get_ltx(LEVEL0, f.min_txid, f.max_txid).await?;
+            buffers.push(bytes.to_vec());
+        }
+
+        let refs: Vec<&[u8]> = buffers.iter().map(|v| v.as_slice()).collect();
+        let inputs = refs.len();
+        let merged = compact(&refs)?;
+
+        // Publish the new base, then delete what it supersedes.
+        self.client
+            .put_ltx(LEVEL1, 1, new_max, Bytes::from(merged))
+            .await?;
+        let mut pruned = 0;
+        if let Some(b) = base {
+            self.client
+                .delete_ltx(LEVEL1, b.min_txid, b.max_txid)
+                .await?;
+            pruned += 1;
+        }
+        for f in to_merge {
+            self.client
+                .delete_ltx(LEVEL0, f.min_txid, f.max_txid)
+                .await?;
+            pruned += 1;
+        }
+
+        Ok(Some(CompactionInfo {
+            min_txid: 1,
+            max_txid: new_max,
+            inputs,
+            pruned,
+        }))
+    }
 }
 
 fn now_ms() -> i64 {
@@ -441,17 +526,29 @@ fn checksums_from_image(image: &[u8], page_size: usize) -> (Vec<Checksum>, Check
     (v, post)
 }
 
-/// Reads the highest-TXID LTX header to recover the resume position.
+/// Lists every LTX file across all levels as `(level, min_txid, max_txid)`.
+async fn list_all_levels(client: &ReplicaClient) -> Result<Vec<(u32, u64, u64)>, SyncError> {
+    let mut files = Vec::new();
+    for level in 0..=MAX_LEVEL {
+        for f in client.list_ltx(level).await? {
+            files.push((level, f.min_txid, f.max_txid));
+        }
+    }
+    Ok(files)
+}
+
+/// Reads the highest-TXID LTX header to recover the resume position. The newest
+/// file is a kept L0 (compaction keeps it), so it carries the WAL position.
 async fn derive_position(client: &ReplicaClient) -> Result<Position, SyncError> {
-    let files = client.list_ltx(LEVEL0).await?;
-    let Some(last) = files.last() else {
+    let files = list_all_levels(client).await?;
+    let Some(&(level, min, max)) = files.iter().max_by_key(|(_, _, max)| *max) else {
         return Ok(Position::default());
     };
-    let bytes = client.get_ltx(LEVEL0, last.min_txid, last.max_txid).await?;
+    let bytes = client.get_ltx(level, min, max).await?;
     let mut dec = Decoder::new(&bytes[..]);
     let header = dec.decode_header()?;
     Ok(Position {
-        txid: last.max_txid,
+        txid: max,
         wal_offset: (header.wal_offset + header.wal_size) as u64,
         salt1: header.wal_salt1,
         salt2: header.wal_salt2,
@@ -459,17 +556,35 @@ async fn derive_position(client: &ReplicaClient) -> Result<Position, SyncError> 
     })
 }
 
-/// Reconstructs the database image from a replica's LTX chain by applying the
-/// snapshot and every incremental in TXID order.
-pub async fn restore(client: &ReplicaClient) -> Result<Vec<u8>, SyncError> {
-    let files = client.list_ltx(LEVEL0).await?;
-    if files.first().map(|f| f.min_txid) != Some(1) {
+/// A greedy restore plan: starting from TXID 1, repeatedly pick the file that
+/// begins contiguously and reaches the furthest, preferring higher (compacted)
+/// levels on ties. This uses the fewest files to cover the whole range.
+fn plan_restore(files: &[(u32, u64, u64)]) -> Result<Vec<(u32, u64, u64)>, SyncError> {
+    let mut plan: Vec<(u32, u64, u64)> = Vec::new();
+    let mut pos: u64 = 0;
+    while let Some(&next) = files
+        .iter()
+        .filter(|(_, min, max)| *min <= pos + 1 && *max > pos)
+        .max_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)))
+    {
+        pos = next.2;
+        plan.push(next);
+    }
+    if plan.first().map(|(_, min, _)| *min) != Some(1) {
         return Err(SyncError::NoSnapshot);
     }
+    Ok(plan)
+}
+
+/// Reconstructs the database image from a replica's LTX chain, using compacted
+/// levels where available and applying incrementals in TXID order.
+pub async fn restore(client: &ReplicaClient) -> Result<Vec<u8>, SyncError> {
+    let files = list_all_levels(client).await?;
+    let plan = plan_restore(&files)?;
 
     let mut image: Vec<u8> = Vec::new();
-    for f in files {
-        let bytes = client.get_ltx(LEVEL0, f.min_txid, f.max_txid).await?;
+    for (level, min, max) in plan {
+        let bytes = client.get_ltx(level, min, max).await?;
         let mut dec = Decoder::new(&bytes[..]);
         let header = dec.decode_header()?;
         let page_size = header.page_size as usize;

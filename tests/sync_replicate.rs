@@ -190,6 +190,84 @@ async fn survives_truncate_checkpoint_and_new_generation() {
 }
 
 #[tokio::test]
+async fn compaction_bounds_the_chain_and_restore_still_works() {
+    let tc = TempCase::new("compact");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+
+    // 5 syncs -> snapshot(1) + incrementals(2..5) = 5 L0 files, 100 rows.
+    for b in 0..5 {
+        insert_range(&w, b * 20 + 1, b * 20 + 21, "batch");
+        syncer.sync().await.unwrap();
+    }
+    assert_eq!(client.list_ltx(0).await.unwrap().len(), 5);
+
+    // Compact: fold L0[1..4] into an L1 base, keep the newest L0 (txid 5).
+    let info = syncer.compact().await.unwrap().unwrap();
+    assert_eq!((info.min_txid, info.max_txid), (1, 4));
+    assert_eq!(client.list_ltx(1).await.unwrap().len(), 1, "one L1 base");
+    assert_eq!(
+        client.list_ltx(0).await.unwrap().len(),
+        1,
+        "only the kept head L0"
+    );
+
+    // Restore now uses the compacted base + the kept L0 and is still correct.
+    let image = restore(&client).await.unwrap();
+    let (integrity, count) = validate_image(&tc.dir, &image);
+    assert_eq!(integrity, "ok");
+    assert_eq!(count, 100);
+
+    // Syncing continues past compaction; restore stays correct.
+    insert_range(&w, 101, 121, "after");
+    syncer.sync().await.unwrap();
+    let image = restore(&client).await.unwrap();
+    let (integrity, count) = validate_image(&tc.dir, &image);
+    assert_eq!(integrity, "ok");
+    assert_eq!(count, 120);
+}
+
+#[tokio::test]
+async fn resumes_across_levels_after_compaction() {
+    let tc = TempCase::new("resume");
+    let client = memory_client();
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+
+    // First syncer: 4 syncs, then compact (L1[1..3] base + kept L0[4]).
+    {
+        let db = Db::open(&tc.db_path).unwrap();
+        let mut s1 = Syncer::open(db, client.clone()).await.unwrap();
+        for b in 0..4 {
+            insert_range(&w, b * 20 + 1, b * 20 + 21, "x");
+            s1.sync().await.unwrap();
+        }
+        s1.compact().await.unwrap().unwrap();
+        // s1 (and its writer lock) drops here.
+    }
+
+    // A fresh syncer resumes from the kept L0 head across levels.
+    let db2 = Db::open(&tc.db_path).unwrap();
+    let mut s2 = Syncer::open(db2, client.clone()).await.unwrap();
+    assert_eq!(s2.position_txid(), 4, "resumed at the kept L0 head");
+
+    insert_range(&w, 81, 101, "y");
+    assert!(matches!(
+        s2.sync().await.unwrap(),
+        SyncOutcome::Incremental { txid: 5, .. }
+    ));
+
+    let image = restore(&client).await.unwrap();
+    let (integrity, count) = validate_image(&tc.dir, &image);
+    assert_eq!(integrity, "ok");
+    assert_eq!(count, 100);
+}
+
+#[tokio::test]
 async fn equivocation_is_detected_on_upload() {
     let tc = TempCase::new("equiv");
     let db = Db::open(&tc.db_path).unwrap();

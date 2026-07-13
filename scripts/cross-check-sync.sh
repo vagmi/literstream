@@ -24,9 +24,12 @@ echo "1. literstream replicates a live database"
 cargo run --quiet --example replicate -- "$DB" "$REPLICA"
 echo
 
-LTXDIR="$REPLICA/ltx/0"
-# Zero-padded hex filenames sort numerically under the default glob.
-FILES=("$LTXDIR"/*.ltx)
+# Gather LTX files across all levels, ordered by TXID (their zero-padded hex
+# basename), so a compacted L1 base is applied before the newer L0 files.
+FILES=()
+while IFS= read -r f; do
+  FILES+=("$f")
+done < <(for f in "$REPLICA"/ltx/*/*.ltx; do echo "$(basename "$f")|$f"; done | sort | cut -d'|' -f2)
 
 echo "2. ltx verify each file"
 for f in "${FILES[@]}"; do

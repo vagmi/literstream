@@ -20,12 +20,14 @@
 //! binary compatibility against the Go `superfly/ltx` tooling.
 
 mod checksum;
+mod compactor;
 mod decoder;
 mod encoder;
 mod error;
 mod format;
 
 pub use checksum::{CHECKSUM_FLAG, Checksum, Hasher, checksum_page};
+pub use compactor::compact;
 pub use decoder::{Decoder, PageIndexElem, Snapshot, read_snapshot};
 pub use encoder::{Encoder, write_snapshot};
 pub use error::LtxError;

@@ -65,14 +65,27 @@ async fn main() -> ExitCode {
         .unwrap();
     println!("sync 3: {:?}", syncer.sync().await.unwrap());
 
-    println!("replica dir: {}", root.join("ltx/0").display());
-    let mut files: Vec<_> = std::fs::read_dir(root.join("ltx/0"))
-        .unwrap()
-        .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
-        .collect();
-    files.sort();
-    for f in files {
-        println!("  {f}");
+    // Compact the L0 chain into an L1 base (keeps the newest L0).
+    if let Some(info) = syncer.compact().await.unwrap() {
+        println!(
+            "compacted: L1[{:016x}..{:016x}] from {} inputs, pruned {} files",
+            info.min_txid, info.max_txid, info.inputs, info.pruned
+        );
+    }
+
+    println!("replica files under {}:", root.join("ltx").display());
+    for level in [1u32, 0u32] {
+        let dir = root.join(format!("ltx/{level}"));
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        let mut files: Vec<_> = rd
+            .filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned()))
+            .collect();
+        files.sort();
+        for f in files {
+            println!("  ltx/{level}/{f}");
+        }
     }
     ExitCode::SUCCESS
 }
