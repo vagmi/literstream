@@ -7,3 +7,4 @@ Cargo.lock
 *shm
 !src/wal
 docker/garage/.garage.env
+.envrc

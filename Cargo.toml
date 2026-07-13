@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 bytes = "1.12.1"
 futures = "0.3.32"
+libc = "0.2.186"
 # LZ4 *block* codec (raw blocks, no frame/size prefix) — matches the
 # pierrec/lz4 UncompressBlock/CompressBlock that superfly/ltx uses per page.
 lz4_flex = "0.11"

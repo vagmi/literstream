@@ -5,6 +5,7 @@
 //! uses for replication. See `plans/implementation.md` for the roadmap.
 
 pub mod db;
+pub mod lock;
 pub mod ltx;
 pub mod storage;
 pub mod sync;

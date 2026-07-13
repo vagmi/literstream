@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use literstream::db::{CheckpointMode, Db};
 use literstream::storage::ReplicaClient;
-use literstream::sync::{SyncOutcome, Syncer, restore};
+use literstream::sync::{SyncError, SyncOutcome, Syncer, restore};
 use object_store::memory::InMemory;
 use rusqlite::Connection;
 
@@ -187,4 +187,49 @@ async fn survives_truncate_checkpoint_and_new_generation() {
     let (integrity, count) = validate_image(&tc.dir, &image);
     assert_eq!(integrity, "ok");
     assert_eq!(count, 300);
+}
+
+#[tokio::test]
+async fn equivocation_is_detected_on_upload() {
+    let tc = TempCase::new("equiv");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+    insert_range(&w, 1, 51, "first");
+    assert!(matches!(
+        syncer.sync().await.unwrap(),
+        SyncOutcome::Snapshot { txid: 1, .. }
+    ));
+
+    // Simulate another writer that already wrote a *different* LTX at txid 2.
+    client
+        .put_ltx(0, 2, 2, bytes::Bytes::from_static(b"a different ltx"))
+        .await
+        .unwrap();
+
+    insert_range(&w, 51, 101, "second");
+    let err = syncer.sync().await.unwrap_err();
+    assert!(
+        matches!(err, SyncError::Equivocation { txid: 2 }),
+        "expected equivocation at txid 2, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn single_writer_lock_rejects_a_second_syncer() {
+    let tc = TempCase::new("writerlock");
+
+    let db1 = Db::open(&tc.db_path).unwrap();
+    let _s1 = Syncer::open(db1, memory_client()).await.unwrap();
+
+    // A second syncer on the same database cannot acquire the writer lock.
+    let db2 = Db::open(&tc.db_path).unwrap();
+    let result = Syncer::open(db2, memory_client()).await;
+    assert!(
+        matches!(result, Err(SyncError::Lock(_))),
+        "expected a lock error from the second syncer"
+    );
 }

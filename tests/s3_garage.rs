@@ -75,6 +75,10 @@ fn insert_range(c: &Connection, lo: i64, hi: i64, note: &str) {
     c.execute_batch("COMMIT").unwrap();
 }
 
+// NOTE: the CAS equivocation guard (put_ltx_cas) needs a backend that enforces
+// conditional PUT (If-None-Match). Garage v1.0.1 does NOT enforce it, so it is
+// tested against InMemory (unit test in src/storage) and GCS (tests/gcs.rs).
+
 #[tokio::test]
 #[ignore = "requires Garage: scripts/garage-up.sh + source docker/garage/.garage.env"]
 async fn replicate_and_restore_over_garage_s3() {

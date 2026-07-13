@@ -22,8 +22,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bytes::Bytes;
 
 use crate::db::{CheckpointMode, CheckpointResult, Db};
+use crate::lock::ProcessLock;
 use crate::ltx::{CHECKSUM_FLAG, Checksum, Decoder, Encoder, Header, checksum_page, lock_pgno};
-use crate::storage::ReplicaClient;
+use crate::storage::{PutOutcome, ReplicaClient};
 use crate::wal::{PageMap, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalHeader, WalReader};
 
 mod error;
@@ -83,6 +84,8 @@ pub struct Syncer {
     pos: Position,
     page_checksums: Vec<Checksum>,
     post_apply: Checksum,
+    /// Held for the syncer's lifetime to enforce a single host-local writer.
+    _lock: ProcessLock,
     /// PASSIVE checkpoint when the WAL reaches this many frames.
     pub min_checkpoint_frames: u64,
     /// TRUNCATE checkpoint at this many frames (0 disables).
@@ -91,7 +94,11 @@ pub struct Syncer {
 
 impl Syncer {
     /// Opens a syncer over `client`, resuming from any existing chain there.
+    ///
+    /// Takes a host-local single-writer lock on the database; fails with
+    /// [`SyncError::Lock`] if another literstream process holds it.
     pub async fn open(db: Db, client: ReplicaClient) -> Result<Syncer, SyncError> {
+        let lock = ProcessLock::acquire(db.path())?;
         let pos = derive_position(&client).await?;
         let (page_checksums, post_apply) = if pos.txid > 0 {
             let image = restore(&client).await?;
@@ -105,9 +112,20 @@ impl Syncer {
             pos,
             page_checksums,
             post_apply,
+            _lock: lock,
             min_checkpoint_frames: DEFAULT_MIN_CHECKPOINT_FRAMES,
             truncate_frames: DEFAULT_TRUNCATE_FRAMES,
         })
+    }
+
+    /// Syncs repeatedly until no new frames remain, returning the number of LTX
+    /// files written. Use this to drain before shutdown.
+    pub async fn flush(&mut self) -> Result<u32, SyncError> {
+        let mut written = 0;
+        while self.sync().await? != SyncOutcome::Skipped {
+            written += 1;
+        }
+        Ok(written)
     }
 
     pub fn db(&self) -> &Db {
@@ -133,9 +151,16 @@ impl Syncer {
             return Ok(SyncOutcome::Skipped);
         };
 
-        self.client
-            .put_ltx(LEVEL0, b.min_txid, b.max_txid, Bytes::from(b.bytes))
-            .await?;
+        // Guard against split-brain: never overwrite a different LTX already at
+        // this TXID. Identical bytes = an idempotent retry of our own upload.
+        match self
+            .client
+            .put_ltx_cas(LEVEL0, b.min_txid, b.max_txid, Bytes::from(b.bytes))
+            .await?
+        {
+            PutOutcome::Created | PutOutcome::AlreadyIdentical => {}
+            PutOutcome::Conflict => return Err(SyncError::Equivocation { txid: b.max_txid }),
+        }
 
         self.pos = b.new_pos;
         self.page_checksums = b.new_page_checksums;

@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload, path::Path as ObjectPath};
+use object_store::{
+    ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, path::Path as ObjectPath,
+};
 
 mod error;
 pub use error::StorageError;
@@ -22,6 +24,19 @@ pub struct LtxFileInfo {
     pub min_txid: u64,
     pub max_txid: u64,
     pub size: u64,
+}
+
+/// The result of a compare-and-swap [`ReplicaClient::put_ltx_cas`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PutOutcome {
+    /// The object did not exist and was written.
+    Created,
+    /// The object already existed with byte-identical content — an idempotent
+    /// retry of our own write. Safe to treat as success.
+    AlreadyIdentical,
+    /// The object already existed with *different* content — another writer
+    /// produced a different LTX at this TXID (split-brain). Never overwrite.
+    Conflict,
 }
 
 /// An async handle to a replica's object storage.
@@ -57,7 +72,7 @@ impl ReplicaClient {
         ))
     }
 
-    /// Uploads an LTX object.
+    /// Uploads an LTX object, unconditionally overwriting any existing one.
     pub async fn put_ltx(
         &self,
         level: u32,
@@ -68,6 +83,48 @@ impl ReplicaClient {
         let key = self.ltx_key(level, min_txid, max_txid);
         self.store.put(&key, PutPayload::from_bytes(bytes)).await?;
         Ok(())
+    }
+
+    /// Uploads an LTX object with an if-not-exists guard.
+    ///
+    /// If the object already exists, the existing bytes are fetched and
+    /// compared: identical content is an idempotent retry ([`PutOutcome::AlreadyIdentical`]),
+    /// differing content is a split-brain [`PutOutcome::Conflict`] and is never
+    /// overwritten. This is the load-bearing multi-writer safety primitive.
+    pub async fn put_ltx_cas(
+        &self,
+        level: u32,
+        min_txid: u64,
+        max_txid: u64,
+        bytes: Bytes,
+    ) -> Result<PutOutcome, StorageError> {
+        let key = self.ltx_key(level, min_txid, max_txid);
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            ..Default::default()
+        };
+        match self
+            .store
+            .put_opts(&key, PutPayload::from_bytes(bytes.clone()), opts)
+            .await
+        {
+            Ok(_) => Ok(PutOutcome::Created),
+            // AlreadyExists is the normal create-conflict; Precondition can
+            // surface when a retry of a *succeeded* conditional PUT sees the
+            // object it already wrote. Both mean "an object is already here".
+            Err(
+                object_store::Error::AlreadyExists { .. }
+                | object_store::Error::Precondition { .. },
+            ) => {
+                let existing = self.store.get(&key).await?.bytes().await?;
+                if existing == bytes {
+                    Ok(PutOutcome::AlreadyIdentical)
+                } else {
+                    Ok(PutOutcome::Conflict)
+                }
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Downloads an LTX object.
@@ -125,4 +182,45 @@ pub fn parse_ltx_filename(name: &str) -> Option<(u64, u64)> {
         u64::from_str_radix(min, 16).ok()?,
         u64::from_str_radix(max, 16).ok()?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use object_store::memory::InMemory;
+
+    #[tokio::test]
+    async fn cas_guard_detects_idempotent_retry_and_conflict() {
+        let client = ReplicaClient::new(Arc::new(InMemory::new()), "db");
+
+        // First write creates the object.
+        assert_eq!(
+            client
+                .put_ltx_cas(0, 1, 1, Bytes::from_static(b"alpha"))
+                .await
+                .unwrap(),
+            PutOutcome::Created
+        );
+        // Re-writing identical bytes is a safe idempotent retry.
+        assert_eq!(
+            client
+                .put_ltx_cas(0, 1, 1, Bytes::from_static(b"alpha"))
+                .await
+                .unwrap(),
+            PutOutcome::AlreadyIdentical
+        );
+        // Different bytes at the same key is split-brain — never overwritten.
+        assert_eq!(
+            client
+                .put_ltx_cas(0, 1, 1, Bytes::from_static(b"beta"))
+                .await
+                .unwrap(),
+            PutOutcome::Conflict
+        );
+        // The original content is intact.
+        assert_eq!(
+            client.get_ltx(0, 1, 1).await.unwrap(),
+            Bytes::from_static(b"alpha")
+        );
+    }
 }
