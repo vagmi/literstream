@@ -1,30 +1,29 @@
-//! The WAL→LTX sync engine (Phase 3): monitor a live database's WAL and turn
-//! newly-committed frames into an immutable LTX chain on local disk.
+//! The WAL→LTX sync engine (Phases 3–4): monitor a live database's WAL and turn
+//! newly-committed frames into an immutable LTX chain in object storage.
 //!
-//! This ties together the pure-bytes pieces: [`crate::db`] controls SQLite and
-//! checkpoints, [`crate::wal`] reads committed frames, and [`crate::ltx`]
-//! encodes them. It mirrors litestream's model:
+//! It ties together the pure-bytes pieces — [`crate::db`] controls SQLite and
+//! checkpoints, [`crate::wal`] reads committed frames, [`crate::ltx`] encodes
+//! them — and stores the result through a [`ReplicaClient`] over any
+//! `object_store` backend (in-memory, local disk, S3/Garage, GCS).
 //!
-//! - Each sync produces **one L0 LTX file** at `TXID = prev + 1`
-//!   (`MinTXID == MaxTXID`), stored at `<root>/ltx/0/<min>-<max>.ltx`.
-//! - The **first** sync writes a snapshot (`MinTXID = 1`, all pages); later syncs
-//!   write only the pages changed in the new WAL segment.
-//! - The header records `WALOffset`/`WALSize`/salts so the next sync knows where
-//!   to resume; salt changes / truncation fall back to a snapshot when the
-//!   incremental chain can't continue.
+//! Async shape: the SQLite/WAL read and LTX encoding happen synchronously under
+//! a pinned read lock; the lock is then released and the resulting bytes are
+//! `await`-uploaded. Replication position advances only after a successful
+//! upload, so a failed upload is retried from the same point.
 //!
-//! Unlike litestream (which sets `NoChecksum`), we maintain the **rolling
-//! database checksum** — the XOR of every page's checksum — updating it
-//! incrementally as pages change. This is O(changed pages) per sync and lets the
-//! standard `ltx apply` tool replay our chain (it verifies pre/post-apply
-//! checksums against the reconstructed database).
+//! Model (as litestream): each sync = one L0 file at `TXID = prev+1`
+//! (`MinTXID == MaxTXID`); the first sync writes a `MinTXID=1` snapshot, later
+//! syncs only the changed pages. We maintain the real rolling database checksum
+//! (see the crate docs) so the standard `ltx apply` can replay our chain.
 
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use bytes::Bytes;
 
 use crate::db::{CheckpointMode, CheckpointResult, Db};
 use crate::ltx::{CHECKSUM_FLAG, Checksum, Decoder, Encoder, Header, checksum_page, lock_pgno};
+use crate::storage::ReplicaClient;
 use crate::wal::{PageMap, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalHeader, WalReader};
 
 mod error;
@@ -34,6 +33,9 @@ pub use error::SyncError;
 pub const DEFAULT_MIN_CHECKPOINT_FRAMES: u64 = 1000;
 /// Default WAL-frame threshold for an emergency TRUNCATE checkpoint.
 pub const DEFAULT_TRUNCATE_FRAMES: u64 = 10_000;
+
+/// L0 is the raw, uncompacted level.
+const LEVEL0: u32 = 0;
 
 /// What a single [`Syncer::sync`] produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,29 +52,36 @@ pub enum SyncOutcome {
 #[derive(Clone, Copy, Debug, Default)]
 struct Position {
     txid: u64,
-    /// Next WAL byte offset to read from (end of the last synced segment).
     wal_offset: u64,
     salt1: u32,
     salt2: u32,
-    /// Whether the last sync reached the exact end of the WAL file.
     synced_to_wal_end: bool,
 }
 
-/// How the next sync should proceed.
 enum Plan {
     Skip,
     Snapshot { offset: u64 },
     Incremental { offset: u64, salt1: u32, salt2: u32 },
 }
 
-/// Replicates a [`Db`]'s WAL to a local LTX directory.
+/// An LTX file built in memory, ready to upload, along with the state changes to
+/// commit once the upload succeeds.
+struct BuiltFile {
+    outcome: SyncOutcome,
+    min_txid: u64,
+    max_txid: u64,
+    bytes: Vec<u8>,
+    new_pos: Position,
+    new_page_checksums: Vec<Checksum>,
+    new_post_apply: Checksum,
+}
+
+/// Replicates a [`Db`]'s WAL to an object-store replica.
 pub struct Syncer {
     db: Db,
-    ltx_dir: PathBuf,
+    client: ReplicaClient,
     pos: Position,
-    /// Per-page checksum of the current database state (index = pgno - 1).
     page_checksums: Vec<Checksum>,
-    /// Rolling database checksum (XOR of `page_checksums`, with the flag bit).
     post_apply: Checksum,
     /// PASSIVE checkpoint when the WAL reaches this many frames.
     pub min_checkpoint_frames: u64,
@@ -81,25 +90,18 @@ pub struct Syncer {
 }
 
 impl Syncer {
-    /// Opens a syncer writing under `root/ltx/0`, resuming from any existing
-    /// files there.
-    pub fn open(db: Db, root: impl AsRef<Path>) -> Result<Syncer, SyncError> {
-        let root = root.as_ref();
-        let ltx_dir = root.join("ltx").join("0");
-        fs::create_dir_all(&ltx_dir)?;
-        let pos = derive_position(&ltx_dir)?;
-
-        // On resume, rebuild the checksum state from the existing chain.
+    /// Opens a syncer over `client`, resuming from any existing chain there.
+    pub async fn open(db: Db, client: ReplicaClient) -> Result<Syncer, SyncError> {
+        let pos = derive_position(&client).await?;
         let (page_checksums, post_apply) = if pos.txid > 0 {
-            let image = restore(root)?;
+            let image = restore(&client).await?;
             checksums_from_image(&image, db.page_size() as usize)
         } else {
             (Vec::new(), Checksum::ZERO)
         };
-
         Ok(Syncer {
             db,
-            ltx_dir,
+            client,
             pos,
             page_checksums,
             post_apply,
@@ -112,38 +114,52 @@ impl Syncer {
         &self.db
     }
 
+    pub fn client(&self) -> &ReplicaClient {
+        &self.client
+    }
+
     pub fn position_txid(&self) -> u64 {
         self.pos.txid
     }
 
-    /// Performs one sync cycle under a pinned read lock (so the DB + WAL are a
-    /// consistent snapshot while we read them).
-    pub fn sync(&mut self) -> Result<SyncOutcome, SyncError> {
+    /// Performs one sync cycle: build the LTX under a pinned read lock, then
+    /// upload it and advance the position.
+    pub async fn sync(&mut self) -> Result<SyncOutcome, SyncError> {
         self.db.acquire_read_lock()?;
-        let result = self.sync_inner();
+        let built = self.build_under_lock();
         let _ = self.db.release_read_lock();
-        result
+
+        let Some(b) = built? else {
+            return Ok(SyncOutcome::Skipped);
+        };
+
+        self.client
+            .put_ltx(LEVEL0, b.min_txid, b.max_txid, Bytes::from(b.bytes))
+            .await?;
+
+        self.pos = b.new_pos;
+        self.page_checksums = b.new_page_checksums;
+        self.post_apply = b.new_post_apply;
+        Ok(b.outcome)
     }
 
-    fn sync_inner(&mut self) -> Result<SyncOutcome, SyncError> {
+    /// Reads the WAL/DB and builds the next LTX file (no network I/O).
+    fn build_under_lock(&self) -> Result<Option<BuiltFile>, SyncError> {
         let mut wal_path = self.db.path().to_path_buf().into_os_string();
         wal_path.push("-wal");
         let wal = fs::read(&wal_path).unwrap_or_default();
 
         match self.plan(&wal)? {
-            Plan::Skip => Ok(SyncOutcome::Skipped),
-            Plan::Snapshot { offset } => self.write_snapshot(offset, &wal),
+            Plan::Skip => Ok(None),
+            Plan::Snapshot { offset } => Ok(Some(self.build_snapshot(offset, &wal)?)),
             Plan::Incremental {
                 offset,
                 salt1,
                 salt2,
-            } => self.write_incremental(offset, salt1, salt2, &wal),
+            } => self.build_incremental(offset, salt1, salt2, &wal),
         }
     }
 
-    /// Decides snapshot vs. incremental vs. skip (a simplification of
-    /// litestream's `verify`: we own checkpointing, so `synced_to_wal_end` is a
-    /// sufficient proxy for "the chain can continue").
     fn plan(&self, wal: &[u8]) -> Result<Plan, SyncError> {
         if self.pos.txid == 0 {
             return Ok(Plan::Snapshot {
@@ -164,7 +180,6 @@ impl Syncer {
         let wal_size = wal.len() as u64;
         let salt_match = (header.salt1, header.salt2) == (self.pos.salt1, self.pos.salt2);
 
-        // WAL truncated below our offset, or restarted with new salts.
         if self.pos.wal_offset > wal_size || !salt_match {
             return Ok(if self.pos.synced_to_wal_end {
                 Plan::Incremental {
@@ -186,7 +201,7 @@ impl Syncer {
         })
     }
 
-    fn write_snapshot(&mut self, offset: u64, wal: &[u8]) -> Result<SyncOutcome, SyncError> {
+    fn build_snapshot(&self, offset: u64, wal: &[u8]) -> Result<BuiltFile, SyncError> {
         let page_size = self.db.page_size() as usize;
         let db_bytes = fs::read(self.db.path())?;
 
@@ -208,8 +223,6 @@ impl Syncer {
         let txid = self.pos.txid + 1;
         let lock = lock_pgno(page_size as u32);
 
-        // A full snapshot has no prior state (MinTXID=1); a mid-chain full
-        // rewrite chains off the previous position.
         let pre_apply = if txid == 1 {
             Checksum::ZERO
         } else {
@@ -248,43 +261,45 @@ impl Syncer {
                     }
                 };
                 enc.encode_page(pgno, data)?;
-
                 let cp = checksum_page(pgno, data);
                 page_checksums[pgno as usize - 1] = cp;
                 post = Checksum(CHECKSUM_FLAG | (post.0 ^ cp.0));
             }
-
             enc.set_post_apply_checksum(post);
             enc.finish()?;
         }
 
-        self.write_ltx_file(txid, txid, &buf)?;
-        self.page_checksums = page_checksums;
-        self.post_apply = post;
-        self.pos = Position {
-            txid,
-            wal_offset: offset + wal_size,
-            salt1,
-            salt2,
-            synced_to_wal_end: offset + wal_size == wal.len() as u64,
-        };
-        Ok(SyncOutcome::Snapshot {
-            txid,
-            pages: commit,
+        Ok(BuiltFile {
+            outcome: SyncOutcome::Snapshot {
+                txid,
+                pages: commit,
+            },
+            min_txid: txid,
+            max_txid: txid,
+            bytes: buf,
+            new_pos: Position {
+                txid,
+                wal_offset: offset + wal_size,
+                salt1,
+                salt2,
+                synced_to_wal_end: offset + wal_size == wal.len() as u64,
+            },
+            new_page_checksums: page_checksums,
+            new_post_apply: post,
         })
     }
 
-    fn write_incremental(
-        &mut self,
+    fn build_incremental(
+        &self,
         offset: u64,
         salt1: u32,
         salt2: u32,
         wal: &[u8],
-    ) -> Result<SyncOutcome, SyncError> {
+    ) -> Result<Option<BuiltFile>, SyncError> {
         let page_size = self.db.page_size() as usize;
         let page_map = WalReader::new_at_offset(wal, offset)?.page_map();
         if page_map.pages.is_empty() {
-            return Ok(SyncOutcome::Skipped);
+            return Ok(None);
         }
 
         let wal_size = page_map.end_offset - offset;
@@ -295,9 +310,7 @@ impl Syncer {
         let mut pgnos: Vec<u32> = page_map.pages.keys().copied().collect();
         pgnos.sort_unstable();
 
-        // Update the rolling checksum incrementally: remove each changed page's
-        // old contribution, add its new one.
-        let mut checksums = std::mem::take(&mut self.page_checksums);
+        let mut checksums = self.page_checksums.clone();
         if checksums.len() < commit as usize {
             checksums.resize(commit as usize, Checksum::ZERO);
         }
@@ -320,23 +333,19 @@ impl Syncer {
                 wal_salt2: salt2,
                 node_id: 0,
             })?;
-
             for &pgno in &pgnos {
                 let data = wal_page(wal, page_map.pages[&pgno], page_size);
                 enc.encode_page(pgno, data)?;
-
                 let cp_new = checksum_page(pgno, data);
                 let idx = pgno as usize - 1;
-                let cp_old = checksums[idx];
-                post = Checksum(CHECKSUM_FLAG | (post.0 ^ cp_old.0 ^ cp_new.0));
+                post = Checksum(CHECKSUM_FLAG | (post.0 ^ checksums[idx].0 ^ cp_new.0));
                 checksums[idx] = cp_new;
             }
-
             enc.set_post_apply_checksum(post);
             enc.finish()?;
         }
 
-        // Handle a database shrink (VACUUM): drop removed pages' contributions.
+        // VACUUM shrink: drop removed pages' contributions.
         if (commit as usize) < checksums.len() {
             for cp in &checksums[commit as usize..] {
                 post = Checksum(CHECKSUM_FLAG | (post.0 ^ cp.0));
@@ -344,38 +353,29 @@ impl Syncer {
             checksums.truncate(commit as usize);
         }
 
-        self.write_ltx_file(txid, txid, &buf)?;
-        self.page_checksums = checksums;
-        self.post_apply = post;
         let final_offset = offset + wal_size;
-        self.pos = Position {
-            txid,
-            wal_offset: final_offset,
-            salt1,
-            salt2,
-            synced_to_wal_end: final_offset == wal.len() as u64,
-        };
-        Ok(SyncOutcome::Incremental {
-            txid,
-            pages: pgnos.len(),
-        })
+        Ok(Some(BuiltFile {
+            outcome: SyncOutcome::Incremental {
+                txid,
+                pages: pgnos.len(),
+            },
+            min_txid: txid,
+            max_txid: txid,
+            bytes: buf,
+            new_pos: Position {
+                txid,
+                wal_offset: final_offset,
+                salt1,
+                salt2,
+                synced_to_wal_end: final_offset == wal.len() as u64,
+            },
+            new_page_checksums: checksums,
+            new_post_apply: post,
+        }))
     }
 
-    fn write_ltx_file(&self, min_txid: u64, max_txid: u64, bytes: &[u8]) -> Result<(), SyncError> {
-        let path = self
-            .ltx_dir
-            .join(format!("{min_txid:016x}-{max_txid:016x}.ltx"));
-        let mut tmp = path.clone().into_os_string();
-        tmp.push(".tmp");
-        fs::write(&tmp, bytes)?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    /// Applies the 3-tier checkpoint strategy based on WAL frame count.
-    ///
-    /// Sync before calling this so the frames being checkpointed are already
-    /// captured as LTX.
+    /// Applies the 3-tier checkpoint strategy based on WAL frame count. Sync
+    /// before calling this so the frames being checkpointed are already stored.
     pub fn checkpoint_if_needed(
         &mut self,
     ) -> Result<Option<(CheckpointMode, CheckpointResult)>, SyncError> {
@@ -387,8 +387,7 @@ impl Syncer {
         } else {
             return Ok(None);
         };
-        let result = self.db.checkpoint(mode)?;
-        Ok(Some((mode, result)))
+        Ok(Some((mode, self.db.checkpoint(mode)?)))
     }
 }
 
@@ -404,7 +403,6 @@ fn wal_page(wal: &[u8], frame_offset: u64, page_size: usize) -> &[u8] {
     &wal[start..start + page_size]
 }
 
-/// Computes per-page checksums and the rolling database checksum of an image.
 fn checksums_from_image(image: &[u8], page_size: usize) -> (Vec<Checksum>, Checksum) {
     let n = image.len() / page_size;
     let mut v = Vec::with_capacity(n);
@@ -418,39 +416,17 @@ fn checksums_from_image(image: &[u8], page_size: usize) -> (Vec<Checksum>, Check
     (v, post)
 }
 
-/// Parses an `<min>-<max>.ltx` filename into its TXID range.
-fn parse_ltx_filename(name: &str) -> Option<(u64, u64)> {
-    let stem = name.strip_suffix(".ltx")?;
-    let (min, max) = stem.split_once('-')?;
-    Some((
-        u64::from_str_radix(min, 16).ok()?,
-        u64::from_str_radix(max, 16).ok()?,
-    ))
-}
-
-/// Reads the highest-TXID LTX file to recover the resume position.
-fn derive_position(ltx_dir: &Path) -> Result<Position, SyncError> {
-    let mut best: Option<(u64, PathBuf)> = None;
-    for entry in fs::read_dir(ltx_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some((_min, max)) = parse_ltx_filename(&name)
-            && best.as_ref().map(|(m, _)| max > *m).unwrap_or(true)
-        {
-            best = Some((max, entry.path()));
-        }
-    }
-
-    let Some((max, path)) = best else {
+/// Reads the highest-TXID LTX header to recover the resume position.
+async fn derive_position(client: &ReplicaClient) -> Result<Position, SyncError> {
+    let files = client.list_ltx(LEVEL0).await?;
+    let Some(last) = files.last() else {
         return Ok(Position::default());
     };
-
-    let bytes = fs::read(&path)?;
+    let bytes = client.get_ltx(LEVEL0, last.min_txid, last.max_txid).await?;
     let mut dec = Decoder::new(&bytes[..]);
     let header = dec.decode_header()?;
     Ok(Position {
-        txid: max,
+        txid: last.max_txid,
         wal_offset: (header.wal_offset + header.wal_size) as u64,
         salt1: header.wal_salt1,
         salt2: header.wal_salt2,
@@ -460,26 +436,15 @@ fn derive_position(ltx_dir: &Path) -> Result<Position, SyncError> {
 
 /// Reconstructs the database image from a replica's LTX chain by applying the
 /// snapshot and every incremental in TXID order.
-pub fn restore(root: impl AsRef<Path>) -> Result<Vec<u8>, SyncError> {
-    let ltx_dir = root.as_ref().join("ltx").join("0");
-
-    let mut files: Vec<(u64, u64, PathBuf)> = Vec::new();
-    for entry in fs::read_dir(&ltx_dir)? {
-        let entry = entry?;
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if let Some((min, max)) = parse_ltx_filename(&name) {
-            files.push((min, max, entry.path()));
-        }
-    }
-    files.sort_by_key(|(min, _, _)| *min);
-    if files.first().map(|(min, _, _)| *min) != Some(1) {
+pub async fn restore(client: &ReplicaClient) -> Result<Vec<u8>, SyncError> {
+    let files = client.list_ltx(LEVEL0).await?;
+    if files.first().map(|f| f.min_txid) != Some(1) {
         return Err(SyncError::NoSnapshot);
     }
 
     let mut image: Vec<u8> = Vec::new();
-    for (_min, _max, path) in files {
-        let bytes = fs::read(&path)?;
+    for f in files {
+        let bytes = client.get_ltx(LEVEL0, f.min_txid, f.max_txid).await?;
         let mut dec = Decoder::new(&bytes[..]);
         let header = dec.decode_header()?;
         let page_size = header.page_size as usize;

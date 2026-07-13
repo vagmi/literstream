@@ -2,6 +2,7 @@ use core::fmt;
 
 use crate::db::DbError;
 use crate::ltx::LtxError;
+use crate::storage::StorageError;
 use crate::wal::WalError;
 
 /// Errors from the WAL→LTX sync engine.
@@ -11,6 +12,7 @@ pub enum SyncError {
     Db(DbError),
     Ltx(LtxError),
     Wal(WalError),
+    Storage(StorageError),
     /// An LTX filename in the replica directory was not `<min>-<max>.ltx`.
     BadLtxFilename(String),
     /// The replica has no snapshot to restore from.
@@ -24,6 +26,7 @@ impl fmt::Display for SyncError {
             SyncError::Db(e) => write!(f, "db: {e}"),
             SyncError::Ltx(e) => write!(f, "ltx: {e}"),
             SyncError::Wal(e) => write!(f, "wal: {e}"),
+            SyncError::Storage(e) => write!(f, "storage: {e}"),
             SyncError::BadLtxFilename(n) => write!(f, "bad ltx filename: {n}"),
             SyncError::NoSnapshot => write!(f, "no snapshot available to restore"),
         }
@@ -50,5 +53,10 @@ impl From<LtxError> for SyncError {
 impl From<WalError> for SyncError {
     fn from(e: WalError) -> Self {
         SyncError::Wal(e)
+    }
+}
+impl From<StorageError> for SyncError {
+    fn from(e: StorageError) -> Self {
+        SyncError::Storage(e)
     }
 }

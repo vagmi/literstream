@@ -1,0 +1,19 @@
+# Single-node Garage (S3-compatible object store) for literstream integration
+# tests. Bring it up with scripts/garage-up.sh (which also creates the bucket
+# and access key and writes docker/garage/.garage.env).
+services:
+  garage:
+    image: dxflrs/garage:v1.0.1
+    container_name: literstream-garage
+    ports:
+      - "3900:3900" # S3 API
+      - "3901:3901" # RPC
+      - "3903:3903" # admin API
+    volumes:
+      - ./garage.toml:/etc/garage.toml:ro
+      - garage-meta:/var/lib/garage/meta
+      - garage-data:/var/lib/garage/data
+
+volumes:
+  garage-meta:
+  garage-data:

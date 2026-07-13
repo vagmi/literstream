@@ -6,5 +6,6 @@
 
 pub mod db;
 pub mod ltx;
+pub mod storage;
 pub mod sync;
 pub mod wal;

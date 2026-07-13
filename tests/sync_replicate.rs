@@ -1,20 +1,26 @@
-//! Phase 3 end-to-end tests: replicate a live SQLite database's WAL to a local
-//! LTX chain, then restore and validate against SQLite itself.
+//! Phase 3–4 end-to-end tests: replicate a live SQLite database's WAL to an
+//! in-memory object store, then restore and validate against SQLite itself.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use literstream::db::{CheckpointMode, Db};
+use literstream::storage::ReplicaClient;
 use literstream::sync::{SyncOutcome, Syncer, restore};
+use object_store::memory::InMemory;
 use rusqlite::Connection;
+
+fn memory_client() -> ReplicaClient {
+    ReplicaClient::new(Arc::new(InMemory::new()), "")
+}
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
 struct TempCase {
     dir: PathBuf,
     db_path: PathBuf,
-    root: PathBuf,
 }
 
 impl TempCase {
@@ -30,7 +36,6 @@ impl TempCase {
         std::fs::create_dir_all(&dir).unwrap();
         TempCase {
             db_path: dir.join("app.db"),
-            root: dir.join("replica"),
             dir,
         }
     }
@@ -90,24 +95,25 @@ fn validate_image(dir: &PathBuf, image: &[u8]) -> (String, i64) {
     (integrity, count)
 }
 
-#[test]
-fn snapshot_then_incrementals_restore_to_live_state() {
+#[tokio::test]
+async fn snapshot_then_incrementals_restore_to_live_state() {
     let tc = TempCase::new("chain");
     let db = Db::open(&tc.db_path).unwrap();
-    let mut syncer = Syncer::open(db, &tc.root).unwrap();
+    let client = memory_client();
+    let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
 
     let w = writer(&tc.db_path);
     ensure_table(&w);
 
     insert_range(&w, 1, 101, "first");
     assert!(matches!(
-        syncer.sync().unwrap(),
+        syncer.sync().await.unwrap(),
         SyncOutcome::Snapshot { txid: 1, .. }
     ));
 
     insert_range(&w, 101, 201, "second");
     assert!(matches!(
-        syncer.sync().unwrap(),
+        syncer.sync().await.unwrap(),
         SyncOutcome::Incremental { txid: 2, .. }
     ));
 
@@ -115,15 +121,15 @@ fn snapshot_then_incrementals_restore_to_live_state() {
     w.execute_batch("BEGIN; UPDATE items SET note='updated' WHERE id<=10; COMMIT;")
         .unwrap();
     assert!(matches!(
-        syncer.sync().unwrap(),
+        syncer.sync().await.unwrap(),
         SyncOutcome::Incremental { txid: 3, .. }
     ));
 
     // Nothing new -> skip.
-    assert_eq!(syncer.sync().unwrap(), SyncOutcome::Skipped);
+    assert_eq!(syncer.sync().await.unwrap(), SyncOutcome::Skipped);
 
     // Restore and validate the reconstructed image with SQLite.
-    let image = restore(&tc.root).unwrap();
+    let image = restore(&client).await.unwrap();
     let (integrity, count) = validate_image(&tc.dir, &image);
     assert_eq!(integrity, "ok");
     assert_eq!(count, 200);
@@ -145,11 +151,12 @@ fn snapshot_then_incrementals_restore_to_live_state() {
     );
 }
 
-#[test]
-fn survives_truncate_checkpoint_and_new_generation() {
+#[tokio::test]
+async fn survives_truncate_checkpoint_and_new_generation() {
     let tc = TempCase::new("checkpoint");
     let db = Db::open(&tc.db_path).unwrap();
-    let mut syncer = Syncer::open(db, &tc.root).unwrap();
+    let client = memory_client();
+    let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
     // Aggressive thresholds so a checkpoint fires after the first batch.
     syncer.min_checkpoint_frames = 2;
     syncer.truncate_frames = 2;
@@ -159,7 +166,7 @@ fn survives_truncate_checkpoint_and_new_generation() {
 
     insert_range(&w, 1, 201, "first");
     assert!(matches!(
-        syncer.sync().unwrap(),
+        syncer.sync().await.unwrap(),
         SyncOutcome::Snapshot { txid: 1, .. }
     ));
 
@@ -170,13 +177,13 @@ fn survives_truncate_checkpoint_and_new_generation() {
 
     // New writes land in a fresh WAL generation (new salts).
     insert_range(&w, 201, 301, "second");
-    let outcome = syncer.sync().unwrap();
+    let outcome = syncer.sync().await.unwrap();
     assert!(
         matches!(outcome, SyncOutcome::Incremental { .. }),
         "expected incremental after checkpoint, got {outcome:?}"
     );
 
-    let image = restore(&tc.root).unwrap();
+    let image = restore(&client).await.unwrap();
     let (integrity, count) = validate_image(&tc.dir, &image);
     assert_eq!(integrity, "ok");
     assert_eq!(count, 300);
