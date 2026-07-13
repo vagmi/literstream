@@ -408,3 +408,226 @@ async fn single_writer_lock_rejects_a_second_syncer() {
         "expected a lock error from the second syncer"
     );
 }
+
+#[tokio::test]
+async fn level_cascade_and_snapshot_restore_to_live_state() {
+    let tc = TempCase::new("cascade");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+
+    // 5 syncs -> 5 L0 files (snapshot(1) + incrementals 2..5), 100 rows.
+    for b in 0..5 {
+        insert_range(&w, b * 20 + 1, b * 20 + 21, "batch");
+        syncer.sync().await.unwrap();
+    }
+    assert_eq!(client.list_ltx(0).await.unwrap().len(), 5);
+
+    // Fold L0 -> L1 (a single window covering 1..5, min=1 since L0[1] is a snapshot).
+    let l1 = syncer.compact_level(1).await.unwrap().unwrap();
+    assert_eq!((l1.min_txid, l1.max_txid), (1, 5));
+    // compact_level does not delete the source level (retention's job).
+    assert_eq!(client.list_ltx(0).await.unwrap().len(), 5);
+    assert_eq!(client.list_ltx(1).await.unwrap().len(), 1);
+
+    // Fold L1 -> L2.
+    let l2 = syncer.compact_level(2).await.unwrap().unwrap();
+    assert_eq!((l2.min_txid, l2.max_txid), (1, 5));
+
+    // A full snapshot at the snapshot level for the current position.
+    let snap = syncer.snapshot().await.unwrap().unwrap();
+    assert_eq!((snap.min_txid, snap.max_txid), (1, 5));
+    assert_eq!(client.list_ltx(9).await.unwrap().len(), 1);
+    // Re-snapshotting the same position is a no-op.
+    assert!(syncer.snapshot().await.unwrap().is_none());
+
+    // Restore stitches across levels and matches SQLite exactly.
+    let image = restore(&client).await.unwrap();
+    assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 100));
+
+    // Compacting again with nothing new is a no-op.
+    assert!(syncer.compact_level(1).await.unwrap().is_none());
+
+    // More writes still sync and restore correctly on top of the cascade.
+    insert_range(&w, 101, 121, "after");
+    syncer.sync().await.unwrap();
+    let image = restore(&client).await.unwrap();
+    assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 120));
+}
+
+#[tokio::test]
+async fn resume_reads_wal_state_from_l0_after_snapshot() {
+    let tc = TempCase::new("resume-snap");
+    let client = memory_client();
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+
+    // First syncer: sync a few times, cascade to L1/L2 and take a snapshot whose
+    // max TXID ties the newest L0 — the case that must resolve WAL state from L0.
+    {
+        let db = Db::open(&tc.db_path).unwrap();
+        let mut s1 = Syncer::open(db, client.clone()).await.unwrap();
+        for b in 0..4 {
+            insert_range(&w, b * 20 + 1, b * 20 + 21, "x");
+            s1.sync().await.unwrap();
+        }
+        s1.compact_level(1).await.unwrap().unwrap();
+        s1.snapshot().await.unwrap().unwrap();
+    }
+
+    // A fresh syncer must resume at the newest L0 head (txid 4), not the snapshot.
+    let db2 = Db::open(&tc.db_path).unwrap();
+    let mut s2 = Syncer::open(db2, client.clone()).await.unwrap();
+    assert_eq!(s2.position_txid(), 4, "resumed at the newest L0 head");
+
+    insert_range(&w, 81, 101, "y");
+    assert!(matches!(
+        s2.sync().await.unwrap(),
+        SyncOutcome::Incremental { txid: 5, .. }
+    ));
+    let image = restore(&client).await.unwrap();
+    assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 100));
+}
+
+#[tokio::test]
+async fn retention_prunes_lower_levels_but_keeps_restore_correct() {
+    use std::time::{Duration, SystemTime};
+
+    let tc = TempCase::new("retention");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+
+    // 6 syncs -> 6 L0 files, 120 rows.
+    for b in 0..6 {
+        insert_range(&w, b * 20 + 1, b * 20 + 21, "b");
+        syncer.sync().await.unwrap();
+    }
+    // Cascade L0 -> L1 and take a full snapshot at the current position.
+    syncer.compact_level(1).await.unwrap().unwrap();
+    syncer.snapshot().await.unwrap().unwrap();
+    assert_eq!(client.list_ltx(0).await.unwrap().len(), 6);
+    assert_eq!(client.list_ltx(1).await.unwrap().len(), 1);
+    assert_eq!(client.list_ltx(9).await.unwrap().len(), 1);
+
+    // Use a far-future "now" so every existing file counts as expired; retention
+    // still keeps the newest at each level and never breaks restore.
+    let future = SystemTime::now() + Duration::from_secs(3600);
+
+    // L0 retention: files folded into L1 and old are dropped; newest L0 kept.
+    let removed = syncer
+        .enforce_l0_retention(future, Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert!(removed >= 1, "some L0 files should be pruned");
+    assert_eq!(
+        client.list_ltx(0).await.unwrap().len(),
+        1,
+        "only the newest L0 remains"
+    );
+
+    // Snapshot retention (with cascade prune of lower levels below the retained
+    // snapshot boundary). One snapshot exists, so it is kept as the newest.
+    let min_snap = syncer
+        .enforce_snapshot_retention(future, Duration::from_secs(1), 3)
+        .await
+        .unwrap();
+    assert_eq!(client.list_ltx(9).await.unwrap().len(), 1, "newest snapshot kept");
+    assert!(min_snap == 0 || min_snap == 6);
+
+    // Despite pruning, the latest restore is still byte-correct.
+    let image = restore(&client).await.unwrap();
+    assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 120));
+}
+
+#[tokio::test]
+async fn driver_compacts_during_workload_and_preserves_pitr() {
+    use literstream::sync::{CompactionLevel, CompactionLevels, Driver};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let tc = TempCase::new("driver");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let syncer = Syncer::open(db, client.clone()).await.unwrap();
+
+    // Small intervals so a synthetic clock crosses them quickly. L0 retention is
+    // disabled, so every synced txid stays individually restorable while the
+    // cascade + snapshots run — the "compact during the workload, still PITR" case.
+    let levels = CompactionLevels::new(vec![
+        CompactionLevel { level: 0, interval: Duration::ZERO },
+        CompactionLevel { level: 1, interval: Duration::from_secs(3) },
+    ])
+    .unwrap();
+    let mut driver = Driver::new(syncer, levels)
+        .with_snapshot_interval(Duration::from_secs(5))
+        .with_snapshot_retention(Duration::from_secs(10_000))
+        .with_l0_retention(Duration::ZERO);
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+
+    let base = UNIX_EPOCH + Duration::from_secs(3600);
+    let mut marks: Vec<(u64, i64)> = Vec::new(); // (txid, expected rows)
+    let mut any_compaction = false;
+    let mut any_snapshot = false;
+
+    for i in 0..12u64 {
+        insert_range(&w, i as i64 * 10 + 1, i as i64 * 10 + 11, "d");
+        let report = driver.tick(base + Duration::from_secs(i)).await.unwrap();
+        any_compaction |= !report.compactions.is_empty();
+        any_snapshot |= report.snapshot.is_some();
+        if i == 2 || i == 6 || i == 9 {
+            marks.push((driver.syncer().position_txid(), (i as i64 + 1) * 10));
+        }
+    }
+    driver.flush().await.unwrap();
+
+    assert!(any_compaction, "level compaction should fire during the workload");
+    assert!(any_snapshot, "a snapshot should be taken during the workload");
+
+    // Latest restore is correct.
+    let image = restore(&client).await.unwrap();
+    assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 120));
+
+    // Every mid-history mark is still restorable *exactly* — compaction ran but
+    // the (disabled) L0 retention kept fine granularity.
+    for (txid, rows) in &marks {
+        let r = restore_to_txid(&client, *txid).await.unwrap();
+        assert_eq!(r.txid, *txid);
+        assert_eq!(validate_image(&tc.dir, &r.image), ("ok".into(), *rows));
+    }
+
+    // Now slide the retention window: evict L0 below the last mark. Earlier marks
+    // become unrecoverable (folded into coarser levels), the latest still works —
+    // the granularity/storage tradeoff, now bounded by retention rather than by
+    // compaction destroying history.
+    let (last_txid, _) = *marks.last().unwrap();
+    driver
+        .syncer()
+        .enforce_retention_by_txid(0, last_txid)
+        .await
+        .unwrap();
+
+    // Before eviction the early mark restored *exactly* (asserted above). Now its
+    // L0 file is gone, so a restore to that TXID snaps down to a coarser level
+    // boundary (or errors if it predates every retained file) — granularity is
+    // lost, but the latest image stays byte-correct.
+    let (early_txid, _) = marks[0];
+    match restore_to_txid(&client, early_txid).await {
+        Ok(r) => assert!(
+            r.txid < early_txid,
+            "expected coarser granularity after eviction, still got exact txid {}",
+            r.txid
+        ),
+        Err(SyncError::TxidTooOld { .. }) => {}
+        Err(e) => panic!("unexpected restore error: {e}"),
+    }
+    let image = restore(&client).await.unwrap();
+    assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 120));
+}

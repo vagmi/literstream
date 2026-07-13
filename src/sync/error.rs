@@ -27,6 +27,8 @@ pub enum SyncError {
     TxidTooOld {
         requested: u64,
     },
+    /// A compaction-levels configuration was rejected during validation.
+    InvalidCompactionLevels(String),
 }
 
 impl fmt::Display for SyncError {
@@ -48,6 +50,9 @@ impl fmt::Display for SyncError {
             }
             SyncError::TxidTooOld { requested } => {
                 write!(f, "txid {requested} is older than the oldest retained file")
+            }
+            SyncError::InvalidCompactionLevels(msg) => {
+                write!(f, "invalid compaction levels: {msg}")
             }
         }
     }

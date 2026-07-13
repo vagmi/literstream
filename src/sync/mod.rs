@@ -18,7 +18,7 @@
 //! real litestream binary restores our replicas and we restore its.
 
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 
@@ -31,9 +31,17 @@ use crate::ltx::{
 use crate::storage::{PutOutcome, ReplicaClient};
 use crate::wal::{PageMap, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalHeader, WalReader};
 
+mod driver;
 mod error;
+mod level;
 mod reader;
+mod retention;
+pub use driver::{
+    DEFAULT_L0_RETENTION, DEFAULT_L0_RETENTION_CHECK_INTERVAL, DEFAULT_SNAPSHOT_INTERVAL,
+    DEFAULT_SNAPSHOT_RETENTION, Driver, TickReport,
+};
 pub use error::SyncError;
+pub use level::{CompactionLevel, CompactionLevels, SNAPSHOT_LEVEL};
 pub use reader::ReplicaReader;
 
 /// Default WAL-frame threshold for a PASSIVE checkpoint (~4 MB @ 4 KB).
@@ -43,11 +51,8 @@ pub const DEFAULT_TRUNCATE_FRAMES: u64 = 10_000;
 
 /// L0 is the raw, uncompacted level.
 const LEVEL0: u32 = 0;
-/// Level 9 holds full snapshots (matches litestream's `SnapshotLevel`), where we
-/// write the compacted base so litestream's restore can use it as the base.
-const SNAPSHOT_LEVEL: u32 = 9;
 /// Highest level scanned during restore/resume — covers litestream's levels 0–8
-/// plus the snapshot level 9.
+/// plus the snapshot level 9 ([`SNAPSHOT_LEVEL`]).
 const MAX_LEVEL: u32 = 9;
 
 /// What a [`Syncer::compact`] produced.
@@ -447,6 +452,207 @@ impl Syncer {
             pruned,
         }))
     }
+
+    /// Compacts the previous level (`dst_level - 1`) into `dst_level`, mirroring
+    /// litestream's level-to-level cascade: the source files not yet folded into
+    /// the destination frontier are merged into one new destination window.
+    ///
+    /// Does **not** delete the source files — that's retention's job (so a
+    /// retention window can keep lower levels readable). Returns `None` when the
+    /// destination is already caught up. `dst_level` must be a cascade level
+    /// (`1..=8`); full snapshots go through [`Syncer::snapshot`].
+    pub async fn compact_level(&self, dst_level: u32) -> Result<Option<CompactionInfo>, SyncError> {
+        if dst_level == 0 || dst_level >= SNAPSHOT_LEVEL {
+            return Err(SyncError::InvalidCompactionLevels(format!(
+                "cannot compact into level {dst_level}; use snapshot() for the snapshot level"
+            )));
+        }
+        let src_level = dst_level - 1;
+
+        // The destination frontier: only pull source files past it.
+        let dst_max = self
+            .client
+            .list_ltx(dst_level)
+            .await?
+            .iter()
+            .map(|f| f.max_txid)
+            .max()
+            .unwrap_or(0);
+
+        let mut src: Vec<_> = self
+            .client
+            .list_ltx(src_level)
+            .await?
+            .into_iter()
+            .filter(|f| f.min_txid > dst_max)
+            .collect();
+        src.sort_by_key(|f| (f.min_txid, f.max_txid));
+        if src.is_empty() {
+            return Ok(None);
+        }
+
+        let min_txid = src.first().unwrap().min_txid;
+        let max_txid = src.last().unwrap().max_txid;
+
+        // Fetch in TXID order and k-way merge (keeps the latest version of each
+        // page; NoChecksum, ltx-apply-compatible).
+        let mut buffers = Vec::with_capacity(src.len());
+        for f in &src {
+            buffers.push(self.client.get_ltx(src_level, f.min_txid, f.max_txid).await?.to_vec());
+        }
+        let refs: Vec<&[u8]> = buffers.iter().map(|v| v.as_slice()).collect();
+        let inputs = refs.len();
+        let merged = compact(&refs)?;
+
+        self.client
+            .put_ltx(dst_level, min_txid, max_txid, Bytes::from(merged))
+            .await?;
+
+        Ok(Some(CompactionInfo {
+            min_txid,
+            max_txid,
+            inputs,
+            pruned: 0,
+        }))
+    }
+
+    /// Writes a full database snapshot (`min_txid = 1`) at [`SNAPSHOT_LEVEL`] for
+    /// the latest replicated position — the restore anchor that lets retention
+    /// prune every lower-level file below it.
+    ///
+    /// The image is reconstructed from the existing LTX chain (byte-consistent
+    /// with what a restore would produce), so it never re-reads SQLite and never
+    /// touches the WAL-resume state carried by the newest L0. Returns `None` if
+    /// nothing has been synced yet or a snapshot already covers this position.
+    pub async fn snapshot(&self) -> Result<Option<CompactionInfo>, SyncError> {
+        let files = list_all_levels(&self.client).await?;
+        let Some(max_txid) = files.iter().map(|(_, _, max)| *max).max() else {
+            return Ok(None);
+        };
+        if self
+            .client
+            .list_ltx(SNAPSHOT_LEVEL)
+            .await?
+            .iter()
+            .any(|f| f.min_txid == 1 && f.max_txid == max_txid)
+        {
+            return Ok(None);
+        }
+
+        let plan = plan_restore(&files)?;
+        let inputs = plan.len();
+        let image = apply_plan(&self.client, &plan).await?;
+
+        let page_size = self.db.page_size() as usize;
+        let commit = (image.len() / page_size) as u32;
+        let lock = lock_pgno(page_size as u32);
+
+        let mut buf = Vec::new();
+        {
+            let mut enc = Encoder::new(&mut buf);
+            enc.encode_header(Header {
+                flags: HEADER_FLAG_NO_CHECKSUM,
+                page_size: page_size as u32,
+                commit,
+                min_txid: 1,
+                max_txid,
+                timestamp: now_ms(),
+                pre_apply_checksum: Checksum::ZERO,
+                wal_offset: 0,
+                wal_size: 0,
+                wal_salt1: 0,
+                wal_salt2: 0,
+                node_id: 0,
+            })?;
+            for pgno in 1..=commit {
+                if pgno == lock {
+                    continue;
+                }
+                let start = (pgno as usize - 1) * page_size;
+                enc.encode_page(pgno, &image[start..start + page_size])?;
+            }
+            enc.finish()?;
+        }
+
+        self.client
+            .put_ltx(SNAPSHOT_LEVEL, 1, max_txid, Bytes::from(buf))
+            .await?;
+
+        Ok(Some(CompactionInfo {
+            min_txid: 1,
+            max_txid,
+            inputs,
+            pruned: 0,
+        }))
+    }
+
+    /// Deletes snapshots older than `retention` (keeping the newest), then
+    /// cascade-prunes every level `0..=max_level` below the minimum retained
+    /// snapshot TXID. `now` is passed in for deterministic scheduling. Returns
+    /// the minimum retained snapshot TXID (0 if none were kept by age).
+    pub async fn enforce_snapshot_retention(
+        &self,
+        now: SystemTime,
+        retention: Duration,
+        max_level: u32,
+    ) -> Result<u64, SyncError> {
+        let cutoff = now.checked_sub(retention).unwrap_or(now);
+        let snaps = self.client.list_ltx(SNAPSHOT_LEVEL).await?;
+        let (deleted, min_retained) = retention::snapshot_expired(&snaps, cutoff);
+        for f in &deleted {
+            self.client.delete_ltx(f.level, f.min_txid, f.max_txid).await?;
+        }
+        if min_retained > 0 {
+            for level in 0..=max_level {
+                self.enforce_retention_by_txid(level, min_retained).await?;
+            }
+        }
+        Ok(min_retained)
+    }
+
+    /// Deletes files at `level` whose `max_txid` is below `txid` (keeping the
+    /// newest). Returns the number deleted.
+    pub async fn enforce_retention_by_txid(
+        &self,
+        level: u32,
+        txid: u64,
+    ) -> Result<usize, SyncError> {
+        let files = self.client.list_ltx(level).await?;
+        let deleted = retention::below_txid(&files, txid);
+        for f in &deleted {
+            self.client.delete_ltx(f.level, f.min_txid, f.max_txid).await?;
+        }
+        Ok(deleted.len())
+    }
+
+    /// Deletes L0 files that have been folded into L1 (`max_txid <= max L1 TXID`)
+    /// and are older than `retention`, keeping a contiguous, recent L0 tail and
+    /// always the newest. A zero `retention` disables it. Returns the number
+    /// deleted.
+    pub async fn enforce_l0_retention(
+        &self,
+        now: SystemTime,
+        retention: Duration,
+    ) -> Result<usize, SyncError> {
+        if retention.is_zero() {
+            return Ok(0);
+        }
+        let cutoff = now.checked_sub(retention).unwrap_or(now);
+        let max_l1 = self
+            .client
+            .list_ltx(1)
+            .await?
+            .iter()
+            .map(|f| f.max_txid)
+            .max()
+            .unwrap_or(0);
+        let files = self.client.list_ltx(LEVEL0).await?;
+        let deleted = retention::l0_expired(&files, max_l1, cutoff);
+        for f in &deleted {
+            self.client.delete_ltx(f.level, f.min_txid, f.max_txid).await?;
+        }
+        Ok(deleted.len())
+    }
 }
 
 fn now_ms() -> i64 {
@@ -502,21 +708,39 @@ async fn list_all_levels(client: &ReplicaClient) -> Result<Vec<(u32, u64, u64)>,
     Ok(files)
 }
 
-/// Reads the highest-TXID LTX header to recover the resume position. The newest
-/// file is a kept L0 (compaction keeps it), so it carries the WAL position.
+/// Recovers the resume position from the replica. The TXID is the global maximum
+/// across all levels; the WAL offset/salts come from the newest **L0** file — the
+/// only level that carries live WAL state (compaction and snapshots zero those
+/// fields). Retention always keeps the newest L0, so it's normally present; if no
+/// L0 remains, WAL state is unknown and the next sync re-snapshots.
 async fn derive_position(client: &ReplicaClient) -> Result<Position, SyncError> {
     let files = list_all_levels(client).await?;
-    let Some(&(level, min, max)) = files.iter().max_by_key(|(_, _, max)| *max) else {
+    let Some(&(_, _, txid)) = files.iter().max_by_key(|(_, _, max)| *max) else {
         return Ok(Position::default());
     };
-    let bytes = client.get_ltx(level, min, max).await?;
-    let mut dec = Decoder::new(&bytes[..]);
-    let header = dec.decode_header()?;
+
+    let newest_l0 = files
+        .iter()
+        .filter(|(level, _, _)| *level == LEVEL0)
+        .max_by_key(|(_, _, max)| *max);
+
+    let (wal_offset, salt1, salt2) = if let Some(&(level, min, max)) = newest_l0 {
+        let bytes = client.get_ltx(level, min, max).await?;
+        let header = Decoder::new(&bytes[..]).decode_header()?;
+        (
+            (header.wal_offset + header.wal_size) as u64,
+            header.wal_salt1,
+            header.wal_salt2,
+        )
+    } else {
+        (0, 0, 0)
+    };
+
     Ok(Position {
-        txid: max,
-        wal_offset: (header.wal_offset + header.wal_size) as u64,
-        salt1: header.wal_salt1,
-        salt2: header.wal_salt2,
+        txid,
+        wal_offset,
+        salt1,
+        salt2,
         synced_to_wal_end: false,
     })
 }
@@ -539,6 +763,22 @@ fn plan_restore(files: &[(u32, u64, u64)]) -> Result<Vec<(u32, u64, u64)>, SyncE
         return Err(SyncError::NoSnapshot);
     }
     Ok(plan)
+}
+
+/// A restore plan reaching as close to `target` as the available files allow,
+/// without overshooting it. Filtering to files ending at or before `target`
+/// before planning is what lets a fine-grained L0 file be used for an early
+/// point even when a later snapshot (whose range extends past `target`) exists.
+fn plan_restore_to(
+    files: &[(u32, u64, u64)],
+    target: u64,
+) -> Result<Vec<(u32, u64, u64)>, SyncError> {
+    let filtered: Vec<(u32, u64, u64)> = files
+        .iter()
+        .copied()
+        .filter(|(_, _, max)| *max <= target)
+        .collect();
+    plan_restore(&filtered)
 }
 
 /// A point-in-time restore result: the database image and the TXID it reflects
@@ -578,27 +818,32 @@ pub async fn restore(client: &ReplicaClient) -> Result<Vec<u8>, SyncError> {
 
 /// Restores the database as of `target_txid` (point-in-time recovery).
 ///
-/// Applies every plan file whose range ends at or before `target_txid`. The
-/// result reflects the largest such boundary; if `target_txid` predates the
-/// oldest retained file (e.g. compacted away), returns [`SyncError::TxidTooOld`].
+/// Reconstructs the newest state whose TXID is at or before `target_txid`,
+/// preferring the finest-grained files available (so an exact synced TXID still
+/// in L0 restores exactly). If `target_txid` predates the oldest restorable
+/// point (e.g. it was compacted into a later snapshot and its L0 file was
+/// retention-pruned), returns [`SyncError::TxidTooOld`].
 pub async fn restore_to_txid(
     client: &ReplicaClient,
     target_txid: u64,
 ) -> Result<RestoreResult, SyncError> {
     let files = list_all_levels(client).await?;
-    let plan = plan_restore(&files)?;
-
-    let selected: Vec<(u32, u64, u64)> = plan
-        .into_iter()
-        .take_while(|(_, _, max)| *max <= target_txid)
-        .collect();
-    let Some(&(_, _, txid)) = selected.last() else {
+    let plan = match plan_restore_to(&files, target_txid) {
+        Ok(plan) => plan,
+        Err(SyncError::NoSnapshot) => {
+            return Err(SyncError::TxidTooOld {
+                requested: target_txid,
+            });
+        }
+        Err(e) => return Err(e),
+    };
+    let Some(&(_, _, txid)) = plan.last() else {
         return Err(SyncError::TxidTooOld {
             requested: target_txid,
         });
     };
 
-    let image = apply_plan(client, &selected).await?;
+    let image = apply_plan(client, &plan).await?;
     Ok(RestoreResult { image, txid })
 }
 
@@ -609,19 +854,22 @@ pub async fn restore_to_timestamp(
     timestamp_ms: i64,
 ) -> Result<RestoreResult, SyncError> {
     let files = list_all_levels(client).await?;
-    let plan = plan_restore(&files)?;
 
-    // Plan files are TXID-ordered and their timestamps are monotonic.
+    // The target TXID is the largest `max_txid` among all files whose header
+    // timestamp is at or before the requested time. Each file's timestamp
+    // reflects its newest content, so scanning every level (not just the latest
+    // restore plan) finds the finest boundary — a recent snapshot's timestamp
+    // won't hide the older L0/L1 files that carry earlier points.
     let mut target_txid = 0;
-    for &(level, min, max) in &plan {
+    for &(level, min, max) in &files {
+        if max <= target_txid {
+            continue;
+        }
         let head = client
             .get_ltx_range(level, min, max, 0, HEADER_SIZE as u64)
             .await?;
-        let header = Header::decode(&head)?;
-        if header.timestamp <= timestamp_ms {
+        if Header::decode(&head)?.timestamp <= timestamp_ms {
             target_txid = max;
-        } else {
-            break;
         }
     }
     if target_txid == 0 {

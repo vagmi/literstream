@@ -7,6 +7,7 @@
 //! store's lexicographic listing is also TXID order.
 
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -24,6 +25,9 @@ pub struct LtxFileInfo {
     pub min_txid: u64,
     pub max_txid: u64,
     pub size: u64,
+    /// Object creation time (from the store's `last_modified`), used for
+    /// time-based retention. `None` if the backend didn't report one.
+    pub created_at: Option<SystemTime>,
 }
 
 /// The result of a compare-and-swap [`ReplicaClient::put_ltx_cas`].
@@ -191,6 +195,7 @@ impl ReplicaClient {
                     min_txid,
                     max_txid,
                     size: meta.size,
+                    created_at: Some(meta.last_modified.into()),
                 });
             }
         }
@@ -247,5 +252,23 @@ mod tests {
             client.get_ltx(0, 1, 1).await.unwrap(),
             Bytes::from_static(b"alpha")
         );
+    }
+
+    #[tokio::test]
+    async fn list_reports_size_and_creation_time() {
+        let client = ReplicaClient::new(Arc::new(InMemory::new()), "db");
+        let before = SystemTime::now();
+        client
+            .put_ltx(0, 1, 1, Bytes::from_static(b"alpha"))
+            .await
+            .unwrap();
+
+        let files = client.list_ltx(0).await.unwrap();
+        assert_eq!(files.len(), 1);
+        let f = files[0];
+        assert_eq!((f.min_txid, f.max_txid, f.size), (1, 1, 5));
+        // last_modified is reported and is not from before the write.
+        let created = f.created_at.expect("created_at populated");
+        assert!(created >= before - std::time::Duration::from_secs(1));
     }
 }
