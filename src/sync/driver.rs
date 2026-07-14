@@ -34,6 +34,11 @@ pub const DEFAULT_L0_RETENTION: Duration = Duration::from_secs(5 * 60);
 /// `DefaultL0RetentionCheckInterval` — retention runs periodically, not every tick.
 pub const DEFAULT_L0_RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Default time-based checkpoint interval, mirroring litestream's
+/// `DefaultCheckpointInterval` — so a low-write database still folds its WAL
+/// into the DB file periodically even if it never crosses the frame threshold.
+pub const DEFAULT_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(60);
+
 /// What a single [`Driver::tick`] did.
 #[derive(Clone, Debug)]
 pub struct TickReport {
@@ -47,6 +52,12 @@ pub struct TickReport {
     pub snapshot: Option<CompactionInfo>,
     /// Number of L0 files pruned by time-based retention this tick.
     pub l0_pruned: usize,
+    /// True if the never-block fallback fired this tick: a checkpoint raced a
+    /// write and a catch-up snapshot was taken. The event most worth alarming on.
+    pub resnapshot_fired: bool,
+    /// Bytes of LTX still staged locally awaiting upload (grows during an
+    /// object-store outage; normally 0). Surface it to detect a stuck replica.
+    pub staged_backlog_bytes: u64,
 }
 
 /// Drives continuous replication + tiered compaction + retention for a [`Syncer`].
@@ -57,12 +68,22 @@ pub struct Driver {
     snapshot_retention: Duration,
     l0_retention: Duration,
     l0_retention_interval: Duration,
+    /// Time-based checkpoint cadence (0 disables it).
+    checkpoint_interval: Duration,
     /// The last interval boundary each level was compacted at (index = level).
     last_compaction_boundary: Vec<SystemTime>,
     /// The last interval boundary a snapshot was taken at.
     last_snapshot_boundary: SystemTime,
     /// The last interval boundary L0 retention was enforced at.
     last_l0_retention_boundary: SystemTime,
+    /// When the last checkpoint ran (for the time-based cadence).
+    last_checkpoint_at: SystemTime,
+    /// Whether new frames have been synced since the last checkpoint — gates the
+    /// time-based checkpoint so `_litestream_seq` bookkeeping alone doesn't churn
+    /// LTX files (litestream issue #896).
+    synced_since_checkpoint: bool,
+    /// Snapshot of `Syncer::resnapshot_count` at the last tick, to detect a fire.
+    prev_resnapshots: u64,
 }
 
 impl Driver {
@@ -77,10 +98,22 @@ impl Driver {
             snapshot_retention: DEFAULT_SNAPSHOT_RETENTION,
             l0_retention: DEFAULT_L0_RETENTION,
             l0_retention_interval: DEFAULT_L0_RETENTION_CHECK_INTERVAL,
+            checkpoint_interval: DEFAULT_CHECKPOINT_INTERVAL,
             last_compaction_boundary: vec![UNIX_EPOCH; slots],
             last_snapshot_boundary: UNIX_EPOCH,
             last_l0_retention_boundary: UNIX_EPOCH,
+            last_checkpoint_at: UNIX_EPOCH,
+            synced_since_checkpoint: false,
+            prev_resnapshots: 0,
         }
+    }
+
+    /// Sets the time-based checkpoint interval (0 disables it). A low-write
+    /// database that never crosses the frame threshold still folds its WAL on
+    /// this cadence, so restores stay cheap.
+    pub fn with_checkpoint_interval(mut self, d: Duration) -> Driver {
+        self.checkpoint_interval = d;
+        self
     }
 
     /// Sets how often a full snapshot is written (0 disables snapshots).
@@ -132,10 +165,32 @@ impl Driver {
     pub async fn tick(&mut self, now: SystemTime) -> Result<TickReport, SyncError> {
         // 1. Replicate new frames (one sync captures all committed frames to the
         //    current WAL end), then checkpoint if the WAL has grown enough. If a
-        //    non-blocking checkpoint races the writer, the gap is detected and the
-        //    next sync re-snapshots (see `checkpoint_if_needed`).
+        //    non-blocking checkpoint races the writer, the gap is detected and a
+        //    catch-up snapshot is staged (see `checkpoint_if_needed`).
         let synced = self.syncer.sync().await?;
-        let checkpoint = self.syncer.checkpoint_if_needed().await?;
+        if synced != SyncOutcome::Skipped {
+            self.synced_since_checkpoint = true;
+        }
+        let mut checkpoint = self.syncer.checkpoint_if_needed().await?;
+
+        // Time-based checkpoint: if the frame threshold wasn't crossed but enough
+        // time has passed and we've synced real data since the last checkpoint,
+        // fold the WAL anyway so a low-write database's restore stays cheap.
+        if checkpoint.is_none()
+            && !self.checkpoint_interval.is_zero()
+            && self.synced_since_checkpoint
+            && self.syncer.db().wal_frame_count() > 0
+            && now
+                .duration_since(self.last_checkpoint_at)
+                .map(|d| d >= self.checkpoint_interval)
+                .unwrap_or(false)
+        {
+            checkpoint = Some(self.syncer.checkpoint_now(CheckpointMode::Passive).await?);
+        }
+        if checkpoint.is_some() {
+            self.last_checkpoint_at = now;
+            self.synced_since_checkpoint = false;
+        }
 
         // 2. Level-to-level compaction, once per interval boundary per level.
         let mut compactions = Vec::new();
@@ -176,12 +231,18 @@ impl Driver {
             }
         }
 
+        let resnapshot_count = self.syncer.resnapshot_count();
+        let resnapshot_fired = resnapshot_count > self.prev_resnapshots;
+        self.prev_resnapshots = resnapshot_count;
+
         Ok(TickReport {
             synced,
             checkpoint,
             compactions,
             snapshot,
             l0_pruned,
+            resnapshot_fired,
+            staged_backlog_bytes: self.syncer.staged_backlog_bytes(),
         })
     }
 }

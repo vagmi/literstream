@@ -2,8 +2,9 @@
 //!
 //!     cargo run --example encode_db -- IN.db OUT.ltx
 //!
-//! This is literstream's counterpart to `ltx encode-db`, and the fixture the
-//! cross-tool round-trip script feeds back to Go's `ltx verify`.
+//! This is literstream's counterpart to `ltx encode-db` — a standalone demo of
+//! the snapshot encoder. (Cross-tool compatibility is gated by the litestream
+//! round-trip scripts, `scripts/cross-check-{garage,litestream}.sh`.)
 
 use std::process::ExitCode;
 

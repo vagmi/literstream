@@ -7,6 +7,9 @@
 //! and put/get/list/delete over it. Keys are zero-padded hex so the object
 //! store's lexicographic listing is also TXID order.
 
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -15,6 +18,9 @@ use futures::StreamExt;
 use object_store::{
     ObjectStore, ObjectStoreExt, PutMode, PutOptions, PutPayload, path::Path as ObjectPath,
 };
+
+/// Multipart part size. S3 requires every part except the last to be ≥ 5 MiB.
+const MULTIPART_CHUNK: usize = 8 * 1024 * 1024;
 
 mod error;
 pub use error::StorageError;
@@ -135,6 +141,42 @@ impl ReplicaClient {
         }
     }
 
+    /// Uploads an LTX object by streaming a local file in multipart chunks —
+    /// O(chunk) resident memory, for large files (snapshots, compaction output).
+    ///
+    /// Unlike [`ReplicaClient::put_ltx_cas`], this offers no if-not-exists guard
+    /// (multipart uploads and conditional PUT don't compose in `object_store`),
+    /// so use it only for a file with a single writer of that TXID range.
+    pub async fn put_ltx_multipart(
+        &self,
+        level: u32,
+        min_txid: u64,
+        max_txid: u64,
+        path: &Path,
+    ) -> Result<(), StorageError> {
+        let key = self.ltx_key(level, min_txid, max_txid);
+        let mut upload = self.store.put_multipart(&key).await?;
+
+        let mut file = File::open(path)?;
+        let mut buf = vec![0u8; MULTIPART_CHUNK];
+        loop {
+            let n = fill(&mut file, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let part = PutPayload::from_bytes(Bytes::copy_from_slice(&buf[..n]));
+            if let Err(e) = upload.put_part(part).await {
+                let _ = upload.abort().await;
+                return Err(e.into());
+            }
+            if n < buf.len() {
+                break; // final, short chunk
+            }
+        }
+        upload.complete().await?;
+        Ok(())
+    }
+
     /// Downloads an LTX object.
     pub async fn get_ltx(
         &self,
@@ -208,6 +250,19 @@ impl ReplicaClient {
     }
 }
 
+/// Reads up to `buf.len()` bytes, filling `buf` fully unless EOF is reached
+/// first (so every multipart chunk but the last is exactly `buf.len()`).
+fn fill(f: &mut File, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match f.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
+}
+
 /// Parses `<min>-<max>.ltx` into its TXID range.
 pub fn parse_ltx_filename(name: &str) -> Option<(u64, u64)> {
     let stem = name.strip_suffix(".ltx")?;
@@ -256,6 +311,28 @@ mod tests {
             client.get_ltx(0, 1, 1).await.unwrap(),
             Bytes::from_static(b"alpha")
         );
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_round_trips() {
+        let client = ReplicaClient::new(Arc::new(InMemory::new()), "db");
+        // 20 MiB so the upload spans multiple 8 MiB parts plus a short final one.
+        let data: Vec<u8> = (0..20usize * 1024 * 1024)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(7)) as u8)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("literstream-mp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("big.ltx");
+        std::fs::write(&path, &data).unwrap();
+
+        client.put_ltx_multipart(2, 5, 9, &path).await.unwrap();
+        let got = client.get_ltx(2, 5, 9).await.unwrap();
+        assert_eq!(
+            &got[..],
+            &data[..],
+            "multipart upload round-trips byte-for-byte"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -19,8 +19,11 @@
 
 use std::fs;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::io::{BufWriter, Read, Seek, SeekFrom};
+// Positional file I/O (pread/pwrite): `read_exact_at` / `write_all_at`. Unix
+// (Linux + macOS); a Windows port would use `std::os::windows::fs::FileExt`.
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -28,8 +31,8 @@ use bytes::Bytes;
 use crate::db::{CheckpointMode, CheckpointResult, Db};
 use crate::lock::ProcessLock;
 use crate::ltx::{
-    Checksum, Decoder, Encoder, HEADER_FLAG_NO_CHECKSUM, HEADER_SIZE, Header, compact, lock_pgno,
-    read_file,
+    Checksum, Decoder, Encoder, HEADER_FLAG_NO_CHECKSUM, HEADER_SIZE, Header, INDEX_FOOTER_SIZE,
+    compact, decode_page_frame, decode_page_index, lock_pgno, read_file,
 };
 use crate::storage::{PutOutcome, ReplicaClient};
 use crate::wal::{
@@ -49,8 +52,14 @@ pub use error::SyncError;
 pub use level::{CompactionLevel, CompactionLevels, SNAPSHOT_LEVEL};
 pub use reader::ReplicaReader;
 
-/// Default WAL-frame growth before a checkpoint (~4 MB @ 4 KB).
+/// Default WAL-frame growth before a checkpoint (~4 MB @ 4 KB), mirroring
+/// litestream's `DefaultMinCheckpointPageN`.
 pub const DEFAULT_MIN_CHECKPOINT_FRAMES: u64 = 1000;
+
+/// Default blocking-TRUNCATE checkpoint threshold (~500 MB @ 4 KB), mirroring
+/// litestream's `DefaultTruncatePageN`. The emergency brake that bounds the
+/// on-disk WAL under sustained writes when PASSIVE keeps returning busy.
+pub const DEFAULT_TRUNCATE_FRAMES: u64 = 121359;
 
 /// L0 is the raw, uncompacted level.
 const LEVEL0: u32 = 0;
@@ -97,13 +106,17 @@ enum Plan {
     Incremental { offset: u64, salt1: u32, salt2: u32 },
 }
 
-/// An LTX file built in memory, ready to upload, along with the state changes to
-/// commit once the upload succeeds.
-struct BuiltFile {
+/// An LTX file encoded to a durable local **staging file**, ready to upload,
+/// along with the state changes to commit once the upload succeeds. The file is
+/// fsync'd before it is returned, so it survives a crash (or an aggressive
+/// checkpoint) and is re-uploaded on the next [`Syncer::open`].
+struct StagedFile {
     outcome: SyncOutcome,
+    level: u32,
     min_txid: u64,
     max_txid: u64,
-    bytes: Vec<u8>,
+    /// Path to the fsync'd `.ltx` in the staging directory.
+    path: PathBuf,
     new_pos: Position,
 }
 
@@ -114,17 +127,21 @@ pub struct Syncer {
     pos: Position,
     /// Held for the syncer's lifetime to enforce a single host-local writer.
     _lock: ProcessLock,
-    /// Checkpoint when the WAL grows this many frames past the last checkpoint.
+    /// Non-blocking PASSIVE checkpoint threshold: checkpoint once the current
+    /// WAL generation holds this many logically-synced frames.
     pub min_checkpoint_frames: u64,
-    /// WAL frame count (file high-water) right after the last checkpoint. PASSIVE
-    /// checkpoints don't truncate the `-wal` file, so `wal_frame_count()` reflects
-    /// the high-water, not live frames; we gate the next PASSIVE on growth beyond
-    /// this baseline to avoid checkpointing (and re-snapshotting) every tick.
-    checkpoint_baseline_frames: u64,
-    /// Set when a checkpoint folded frames into the DB that we hadn't replicated
-    /// yet (they now live only in the DB file). The next sync re-snapshots from
-    /// the DB to recover them; cleared once that snapshot succeeds.
-    pending_resync: bool,
+    /// Blocking TRUNCATE checkpoint threshold — a large emergency brake that
+    /// bounds the on-disk WAL under sustained writes. Safe (never loses data)
+    /// because staging makes durability independent of the checkpoint.
+    pub truncate_frames: u64,
+    /// Count of over-fold catch-up snapshots taken (the never-block fallback
+    /// path). Exposed via [`Syncer::resnapshot_count`] so callers can alarm when
+    /// the fallback fires.
+    resnapshots: u64,
+    /// Local staging directory (`<db>-litestream/ltx`). Every LTX is encoded and
+    /// fsync'd here before the checkpoint that could fold its frames into the DB,
+    /// then uploaded and removed. Leftovers are re-uploaded on [`Syncer::open`].
+    staging: PathBuf,
 }
 
 impl Syncer {
@@ -134,6 +151,12 @@ impl Syncer {
     /// [`SyncError::Lock`] if another literstream process holds it.
     pub async fn open(db: Db, client: ReplicaClient) -> Result<Syncer, SyncError> {
         let lock = ProcessLock::acquire(db.path())?;
+        let staging = staging_root(db.path());
+        // Re-upload any staged files a previous run crashed before shipping (and
+        // drop half-written `.tmp` debris). This recovers the exact frames — no
+        // whole-DB re-snapshot — and must run before we derive the position, so
+        // the position reflects the now-complete chain.
+        recover_staging(&staging, &client).await?;
         let pos = derive_position(&client).await?;
         let mut db = db;
         // Pin the WAL read-mark for the syncer's lifetime so an external
@@ -147,8 +170,9 @@ impl Syncer {
             pos,
             _lock: lock,
             min_checkpoint_frames: DEFAULT_MIN_CHECKPOINT_FRAMES,
-            checkpoint_baseline_frames: 0,
-            pending_resync: false,
+            truncate_frames: DEFAULT_TRUNCATE_FRAMES,
+            resnapshots: 0,
+            staging,
         })
     }
 
@@ -181,40 +205,64 @@ impl Syncer {
     pub async fn sync(&mut self) -> Result<SyncOutcome, SyncError> {
         match self.build_next()? {
             None => Ok(SyncOutcome::Skipped),
-            Some(built) => self.commit_built(built).await,
+            Some(staged) => self.upload_staged(staged).await,
         }
     }
 
-    /// Reads the WAL/DB and builds the next LTX file in memory — no network I/O.
-    /// Splitting build from upload lets [`Syncer::checkpoint_if_needed`] hold the
-    /// built frames across a checkpoint (an in-memory shadow), so a WAL reset
-    /// can't lose them.
-    fn build_next(&mut self) -> Result<Option<BuiltFile>, SyncError> {
+    /// Reads the WAL/DB and encodes the next LTX to a fsync'd staging file — no
+    /// network I/O. Splitting staging from upload lets
+    /// [`Syncer::checkpoint_if_needed`] make the frames durable *before* the
+    /// checkpoint that could fold them into the DB, so neither a WAL reset nor a
+    /// crash can lose them.
+    fn build_next(&mut self) -> Result<Option<StagedFile>, SyncError> {
         self.db.acquire_read_lock()?;
         self.build_under_lock()
     }
 
-    /// Uploads an already-built LTX file and advances the replication position.
-    async fn commit_built(&mut self, b: BuiltFile) -> Result<SyncOutcome, SyncError> {
-        // Guard against split-brain: never overwrite a different LTX already at
-        // this TXID. Identical bytes = an idempotent retry of our own upload.
-        match self
-            .client
-            .put_ltx_cas(LEVEL0, b.min_txid, b.max_txid, Bytes::from(b.bytes))
-            .await?
-        {
-            PutOutcome::Created | PutOutcome::AlreadyIdentical => {}
-            PutOutcome::Conflict => return Err(SyncError::Equivocation { txid: b.max_txid }),
-        }
+    /// Uploads a staged LTX file, removes it, and advances the replication
+    /// position. A failed upload leaves the file staged for a later retry.
+    async fn upload_staged(&mut self, s: StagedFile) -> Result<SyncOutcome, SyncError> {
+        upload_ltx_file(&self.client, s.level, s.min_txid, s.max_txid, &s.path).await?;
+        self.pos = s.new_pos;
+        Ok(s.outcome)
+    }
 
-        // A snapshot re-reads the whole DB, recovering any frames a checkpoint
-        // moved out of the WAL — the pending resync is satisfied.
-        if matches!(b.outcome, SyncOutcome::Snapshot { .. }) {
-            self.pending_resync = false;
-        }
+    /// The staged `.ltx` path for `(level, min, max)`.
+    fn staged_ltx_path(&self, level: u32, min: u64, max: u64) -> PathBuf {
+        self.staging
+            .join(format!("{level:04x}"))
+            .join(format!("{min:016x}-{max:016x}.ltx"))
+    }
 
-        self.pos = b.new_pos;
-        Ok(b.outcome)
+    /// Encodes an LTX into the staging directory durably: writes to a `.tmp`
+    /// via a buffered writer, `sync_all`s it, atomically renames to `.ltx`, and
+    /// fsyncs the directory. The renamed `.ltx` is complete-and-durable by
+    /// construction; a leftover `.tmp` is crash debris cleaned on the next open.
+    /// Returns the final `.ltx` path.
+    fn stage<F>(&self, level: u32, min: u64, max: u64, encode: F) -> Result<PathBuf, SyncError>
+    where
+        F: FnOnce(&mut Encoder<BufWriter<File>>) -> Result<(), SyncError>,
+    {
+        let final_path = self.staged_ltx_path(level, min, max);
+        let dir = final_path.parent().expect("staged path has a parent");
+        fs::create_dir_all(dir)?;
+        let tmp = with_extension_suffix(&final_path, ".tmp");
+
+        let mut enc = Encoder::new(BufWriter::new(File::create(&tmp)?));
+        encode(&mut enc)?;
+        enc.finish()?;
+        // `finish` flushed the BufWriter, so `into_inner` won't error.
+        let file = enc
+            .into_inner()
+            .into_inner()
+            .map_err(|e| SyncError::Io(e.into_error()))?;
+        file.sync_all()?;
+        drop(file);
+
+        fs::rename(&tmp, &final_path)?;
+        // Persist the rename (the new directory entry), not just the file data.
+        let _ = File::open(dir).and_then(|d| d.sync_all());
+        Ok(final_path)
     }
 
     /// Reads the WAL/DB and builds the next LTX file (no network I/O).
@@ -222,7 +270,7 @@ impl Syncer {
     /// The frequent incremental path reads only the WAL *tail* (`[offset..]`),
     /// not the whole file, so per-sync memory is bounded to the new frames. Only
     /// the rare snapshot path reads the whole WAL (and DB).
-    fn build_under_lock(&self) -> Result<Option<BuiltFile>, SyncError> {
+    fn build_under_lock(&self) -> Result<Option<StagedFile>, SyncError> {
         let mut p = self.db.path().to_path_buf().into_os_string();
         p.push("-wal");
         let wal_path = std::path::PathBuf::from(p);
@@ -275,22 +323,16 @@ impl Syncer {
         let salt_match = (header.salt1, header.salt2) == (self.pos.salt1, self.pos.salt2);
 
         // A new WAL generation (salt change) or a shrunk WAL means a checkpoint
-        // restarted the log. If that checkpoint folded un-replicated frames into
-        // the DB ([`Self::pending_resync`]), re-snapshot from the DB to recover
-        // them — an incremental would only see the new generation and drop them.
-        // Otherwise the old generation is fully in the LTX chain, so continue
-        // with a cheap incremental from the start of the new generation.
+        // restarted the log. The old generation is fully in the LTX chain (our
+        // pinned read-mark blocks external resets, and our own checkpoints stage
+        // + upload before resetting — with `checkpoint_if_needed` staging a
+        // catch-up snapshot if a write raced the checkpoint), so a cheap
+        // incremental from the start of the new generation is always correct.
         if self.pos.wal_offset > wal_len || !salt_match {
-            return if self.pending_resync {
-                Plan::Snapshot {
-                    offset: WAL_HEADER_SIZE as u64,
-                }
-            } else {
-                Plan::Incremental {
-                    offset: WAL_HEADER_SIZE as u64,
-                    salt1: header.salt1,
-                    salt2: header.salt2,
-                }
+            return Plan::Incremental {
+                offset: WAL_HEADER_SIZE as u64,
+                salt1: header.salt1,
+                salt2: header.salt2,
             };
         }
 
@@ -301,9 +343,12 @@ impl Syncer {
         }
     }
 
-    fn build_snapshot(&self, offset: u64, wal: &[u8]) -> Result<BuiltFile, SyncError> {
+    fn build_snapshot(&self, offset: u64, wal: &[u8]) -> Result<StagedFile, SyncError> {
         let page_size = self.db.page_size() as usize;
-        let db_bytes = fs::read(self.db.path())?;
+        // pread the DB one page at a time instead of slurping the whole file —
+        // DB-side memory is O(page_size), not O(database).
+        let db_file = File::open(self.db.path())?;
+        let db_len = db_file.metadata()?.len() as usize;
 
         let wal_header = (wal.len() >= WAL_HEADER_SIZE)
             .then(|| WalHeader::parse(wal))
@@ -317,15 +362,15 @@ impl Syncer {
         let commit = if page_map.commit > 0 {
             page_map.commit
         } else {
-            (db_bytes.len() / page_size) as u32
+            (db_len / page_size) as u32
         };
         let wal_size = page_map.end_offset.saturating_sub(offset);
         let txid = self.pos.txid + 1;
         let lock = lock_pgno(page_size as u32);
 
-        let mut buf = Vec::new();
-        {
-            let mut enc = Encoder::new(&mut buf);
+        // Encode straight into the fsync'd staging file (O(page_size)).
+        let mut page = vec![0u8; page_size];
+        let path = self.stage(LEVEL0, txid, txid, |enc| {
             enc.encode_header(no_checksum_header(
                 page_size as u32,
                 commit,
@@ -339,26 +384,26 @@ impl Syncer {
                 if pgno == lock {
                     continue;
                 }
-                let data = match page_map.pages.get(&pgno) {
-                    Some(&off) => wal_page(wal, off, page_size),
+                match page_map.pages.get(&pgno) {
+                    Some(&off) => enc.encode_page(pgno, wal_page(wal, off, page_size))?,
                     None => {
-                        let start = (pgno as usize - 1) * page_size;
-                        &db_bytes[start..start + page_size]
+                        db_file.read_exact_at(&mut page, (pgno as u64 - 1) * page_size as u64)?;
+                        enc.encode_page(pgno, &page)?;
                     }
-                };
-                enc.encode_page(pgno, data)?;
+                }
             }
-            enc.finish()?;
-        }
+            Ok(())
+        })?;
 
-        Ok(BuiltFile {
+        Ok(StagedFile {
             outcome: SyncOutcome::Snapshot {
                 txid,
                 pages: commit,
             },
+            level: LEVEL0,
             min_txid: txid,
             max_txid: txid,
-            bytes: buf,
+            path,
             new_pos: Position {
                 txid,
                 wal_offset: offset + wal_size,
@@ -372,6 +417,16 @@ impl Syncer {
         })
     }
 
+    /// Reads the current WAL and stages a full snapshot at the live position,
+    /// regardless of what [`Syncer::plan`] would choose. Used to recover frames a
+    /// checkpoint folded into the DB that we hadn't captured (the over-fold race).
+    fn build_snapshot_now(&self) -> Result<StagedFile, SyncError> {
+        let mut p = self.db.path().to_path_buf().into_os_string();
+        p.push("-wal");
+        let wal = fs::read(PathBuf::from(p)).unwrap_or_default();
+        self.build_snapshot(WAL_HEADER_SIZE as u64, &wal)
+    }
+
     fn build_incremental(
         &self,
         offset: u64,
@@ -380,7 +435,7 @@ impl Syncer {
         wal_len: u64,
         header: WalHeader,
         wal_path: &Path,
-    ) -> Result<Option<BuiltFile>, SyncError> {
+    ) -> Result<Option<StagedFile>, SyncError> {
         let page_size = self.db.page_size() as usize;
         let frame_size = WAL_FRAME_HEADER_SIZE as u64 + page_size as u64;
 
@@ -414,9 +469,8 @@ impl Syncer {
         let mut pgnos: Vec<u32> = page_map.pages.keys().copied().collect();
         pgnos.sort_unstable();
 
-        let mut buf = Vec::new();
-        {
-            let mut enc = Encoder::new(&mut buf);
+        // Encode straight into the fsync'd staging file (O(new frames)).
+        let path = self.stage(LEVEL0, txid, txid, |enc| {
             enc.encode_header(no_checksum_header(
                 page_size as u32,
                 commit,
@@ -430,18 +484,19 @@ impl Syncer {
                 let data = reader.page_data_at(page_map.pages[&pgno]);
                 enc.encode_page(pgno, data)?;
             }
-            enc.finish()?;
-        }
+            Ok(())
+        })?;
 
         let final_offset = offset + wal_size;
-        Ok(Some(BuiltFile {
+        Ok(Some(StagedFile {
             outcome: SyncOutcome::Incremental {
                 txid,
                 pages: pgnos.len(),
             },
+            level: LEVEL0,
             min_txid: txid,
             max_txid: txid,
-            bytes: buf,
+            path,
             new_pos: Position {
                 txid,
                 wal_offset: final_offset,
@@ -455,59 +510,98 @@ impl Syncer {
     /// Checkpoints the WAL when it has grown enough — **without blocking the
     /// application** (litestream's philosophy).
     ///
-    /// It *builds* the pending LTX from the WAL tail (fast, local), checkpoints
-    /// immediately (non-blocking PASSIVE; [`Db::checkpoint`] then seq-bumps to
-    /// restart the WAL and keep it bounded), and only *then* uploads. Holding the
-    /// built frames across the checkpoint — an in-memory shadow — means a WAL
-    /// reset can't lose them, so the race window shrinks from an upload round-trip
-    /// to a local build. If the checkpoint still folds a frame into the DB that we
-    /// hadn't captured (a write landing in that tiny window), we *detect* it and
-    /// re-snapshot on the next sync. Correctness by noticing, never by stalling a
-    /// write.
+    /// It *stages* the pending LTX from the WAL tail (fast, local) to a fsync'd
+    /// file, checkpoints immediately (non-blocking PASSIVE; [`Db::checkpoint`]
+    /// then seq-bumps to restart the WAL and keep it bounded), and only *then*
+    /// uploads. Because the staged file is durable *before* the checkpoint, a WAL
+    /// reset — or a crash — can't lose the frames: they are re-uploaded from
+    /// staging on the next [`Syncer::open`]. If the checkpoint still folds a
+    /// frame into the DB that we hadn't captured (a write landing in that tiny
+    /// window), we *notice* and stage a catch-up snapshot from the DB right here,
+    /// so it too is durable. Correctness by noticing, never by stalling a write.
     pub async fn checkpoint_if_needed(
         &mut self,
     ) -> Result<Option<(CheckpointMode, CheckpointResult)>, SyncError> {
-        let frames = self.db.wal_frame_count();
-        if frames.saturating_sub(self.checkpoint_baseline_frames) < self.min_checkpoint_frames {
+        // Gate on the *logical* WAL frames synced this generation, not the `-wal`
+        // file high-water: a PASSIVE checkpoint leaves stale frames in the file,
+        // so a size-based gate re-triggers every tick (litestream issue #997).
+        let live = self.live_wal_frames();
+        let mode = if live >= self.truncate_frames {
+            CheckpointMode::Truncate // emergency brake (blocking)
+        } else if live >= self.min_checkpoint_frames {
+            CheckpointMode::Passive
+        } else {
             return Ok(None);
-        }
-        let mode = CheckpointMode::Passive;
+        };
+        Ok(Some(self.run_checkpoint(mode).await?))
+    }
 
-        // 1. Build (don't upload) the frames committed up to now. This is the
-        //    in-memory shadow: it survives the WAL reset below.
-        let built = self.build_next()?;
+    /// Runs one stage → checkpoint → upload cycle in `mode`, unconditionally.
+    /// Used by [`Syncer::checkpoint_if_needed`] and the driver's time-based
+    /// checkpoint. Never blocks the writer (beyond a TRUNCATE's reader wait).
+    pub async fn checkpoint_now(
+        &mut self,
+        mode: CheckpointMode,
+    ) -> Result<(CheckpointMode, CheckpointResult), SyncError> {
+        self.run_checkpoint(mode).await
+    }
+
+    async fn run_checkpoint(
+        &mut self,
+        mode: CheckpointMode,
+    ) -> Result<(CheckpointMode, CheckpointResult), SyncError> {
+        // 1. Stage the frames committed up to now to a fsync'd .ltx — durable
+        //    before the checkpoint can fold them into the DB.
+        let staged = self.build_next()?;
         let frame_size = WAL_FRAME_HEADER_SIZE as u64 + self.db.page_size() as u64;
-        let captured_offset = built
+        let captured_offset = staged
             .as_ref()
-            .map(|b| b.new_pos.wal_offset)
+            .map(|s| s.new_pos.wal_offset)
             .unwrap_or(self.pos.wal_offset);
         let synced_frames = captured_offset.saturating_sub(WAL_HEADER_SIZE as u64) / frame_size;
 
-        // 2. Checkpoint immediately — only a local build separates it from the
-        //    capture above.
+        // 2. Checkpoint immediately — safe, the frames are already on disk.
         let result = self.db.checkpoint(mode)?;
 
-        // 3. Upload the captured frames (they outlived the reset because we held
-        //    them). A failure here leaves them in the DB but not the chain, so
-        //    flag a resync to recover from the DB next time.
-        if let Some(b) = built {
-            if let Err(e) = self.commit_built(b).await {
-                self.pending_resync = true;
-                return Err(e);
-            }
+        // 3. Upload the staged file. A failure leaves it in the staging dir; the
+        //    frames are not lost (recovered on the next open()), so surface the
+        //    error and retry later rather than advancing the position.
+        if let Some(s) = staged {
+            self.upload_staged(s).await?;
         }
 
-        // 4. Detect a frame that slipped into the DB during the build→checkpoint
-        //    window (rare): the checkpoint moved more than we captured.
+        // 4. Over-fold: a write landed in the build→checkpoint window and the
+        //    checkpoint folded more frames than we captured. Those frames now
+        //    live only in the DB file, so stage + upload a full snapshot NOW to
+        //    recover them (durable; the staged file survives a crash here too).
         if result.checkpointed_frames as u64 > synced_frames {
-            self.pending_resync = true;
+            let snap = self.build_snapshot_now()?;
+            self.upload_staged(snap).await?;
+            self.resnapshots += 1;
         }
-        // Rebaseline only when the checkpoint made progress, so a skipped (busy)
-        // checkpoint is retried on the next tick.
-        if !result.busy {
-            self.checkpoint_baseline_frames = self.db.wal_frame_count();
-        }
-        Ok(Some((mode, result)))
+
+        Ok((mode, result))
+    }
+
+    /// Logically-synced WAL frames in the current generation (issue #997): the
+    /// replicated extent, immune to the stale high-water a PASSIVE leaves behind.
+    fn live_wal_frames(&self) -> u64 {
+        let frame_size = WAL_FRAME_HEADER_SIZE as u64 + self.db.page_size() as u64;
+        self.pos
+            .wal_offset
+            .saturating_sub(WAL_HEADER_SIZE as u64)
+            / frame_size
+    }
+
+    /// Number of over-fold catch-up snapshots taken (the never-block fallback).
+    pub fn resnapshot_count(&self) -> u64 {
+        self.resnapshots
+    }
+
+    /// Total bytes of LTX files currently awaiting upload in the staging dir —
+    /// the un-shipped backlog (grows during an object-store outage).
+    pub fn staged_backlog_bytes(&self) -> u64 {
+        staged_backlog_bytes(&self.staging)
     }
 
     /// Compacts the L0 chain into a single L1 base, pruning the merged files —
@@ -536,21 +630,21 @@ impl Syncer {
         let to_merge = &new_l0[..new_l0.len() - 1];
         let new_max = to_merge.last().unwrap().max_txid;
 
-        // Fetch inputs in TXID order: the existing base, then the L0 run.
-        let mut buffers: Vec<Vec<u8>> = Vec::new();
+        // Fetch inputs in TXID order: the existing base, then the L0 run. Keep
+        // the ref-counted `Bytes` — no copy into an owned `Vec`.
+        let mut buffers: Vec<Bytes> = Vec::new();
         if let Some(b) = base {
-            let bytes = self
-                .client
-                .get_ltx(SNAPSHOT_LEVEL, b.min_txid, b.max_txid)
-                .await?;
-            buffers.push(bytes.to_vec());
+            buffers.push(
+                self.client
+                    .get_ltx(SNAPSHOT_LEVEL, b.min_txid, b.max_txid)
+                    .await?,
+            );
         }
         for f in to_merge {
-            let bytes = self.client.get_ltx(LEVEL0, f.min_txid, f.max_txid).await?;
-            buffers.push(bytes.to_vec());
+            buffers.push(self.client.get_ltx(LEVEL0, f.min_txid, f.max_txid).await?);
         }
 
-        let refs: Vec<&[u8]> = buffers.iter().map(|v| v.as_slice()).collect();
+        let refs: Vec<&[u8]> = buffers.iter().map(|b| b.as_ref()).collect();
         let inputs = refs.len();
         let merged = compact(&refs)?;
 
@@ -623,11 +717,11 @@ impl Syncer {
 
         // Fetch in TXID order and k-way merge (keeps the latest version of each
         // page; NoChecksum, ltx-apply-compatible).
-        let mut buffers = Vec::with_capacity(src.len());
+        let mut buffers: Vec<Bytes> = Vec::with_capacity(src.len());
         for f in &src {
-            buffers.push(self.client.get_ltx(src_level, f.min_txid, f.max_txid).await?.to_vec());
+            buffers.push(self.client.get_ltx(src_level, f.min_txid, f.max_txid).await?);
         }
-        let refs: Vec<&[u8]> = buffers.iter().map(|v| v.as_slice()).collect();
+        let refs: Vec<&[u8]> = buffers.iter().map(|b| b.as_ref()).collect();
         let inputs = refs.len();
         let merged = compact(&refs)?;
 
@@ -787,6 +881,119 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The staging root for `db_path` — `<db>-litestream/ltx`, mirroring
+/// litestream's `db.LTXDir()`. LTX files are encoded + fsync'd under
+/// `<root>/<level:04x>/` before upload; the layout is local-only (the remote key
+/// layout is unchanged), so it's just a familiar, debuggable shape.
+fn staging_root(db_path: &Path) -> PathBuf {
+    let mut p = db_path.to_path_buf().into_os_string();
+    p.push("-litestream");
+    PathBuf::from(p).join("ltx")
+}
+
+/// Sum of `.ltx` file sizes under a staging root — the un-uploaded backlog.
+fn staged_backlog_bytes(staging: &Path) -> u64 {
+    let Ok(levels) = fs::read_dir(staging) else {
+        return 0;
+    };
+    let mut total = 0;
+    for level in levels.flatten() {
+        let Ok(files) = fs::read_dir(level.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            if f.file_name().to_string_lossy().ends_with(".ltx")
+                && let Ok(m) = f.metadata()
+            {
+                total += m.len();
+            }
+        }
+    }
+    total
+}
+
+/// Returns `path` with `suffix` appended to its file name (e.g. `x.ltx` → `x.ltx.tmp`).
+fn with_extension_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut s = path.to_path_buf().into_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// A staged file at or above this size is streamed to the replica via a
+/// multipart upload (O(chunk) memory); smaller ones are read into memory and
+/// CAS-uploaded. The split keeps the if-not-exists guard on the small, frequent
+/// L0 incrementals (where concurrent writers actually collide) and streams only
+/// the large, effectively-single-writer files (snapshots, compaction output).
+const MULTIPART_THRESHOLD: u64 = 16 * 1024 * 1024;
+
+/// Uploads a staged LTX file to the replica, then removes the local staged copy.
+///
+/// Small files go through the CAS guard (an idempotent retry of our own write is
+/// fine; a genuinely different file at this TXID is [`SyncError::Equivocation`]);
+/// large files stream via multipart (no CAS — see [`MULTIPART_THRESHOLD`]).
+async fn upload_ltx_file(
+    client: &ReplicaClient,
+    level: u32,
+    min: u64,
+    max: u64,
+    path: &Path,
+) -> Result<(), SyncError> {
+    let size = fs::metadata(path)?.len();
+    if size >= MULTIPART_THRESHOLD {
+        client.put_ltx_multipart(level, min, max, path).await?;
+    } else {
+        let bytes = fs::read(path)?;
+        match client
+            .put_ltx_cas(level, min, max, Bytes::from(bytes))
+            .await?
+        {
+            PutOutcome::Created | PutOutcome::AlreadyIdentical => {}
+            PutOutcome::Conflict => return Err(SyncError::Equivocation { txid: max }),
+        }
+    }
+    fs::remove_file(path)?;
+    Ok(())
+}
+
+/// Re-uploads any staged LTX left by a previous run (a crash between staging and
+/// upload) and deletes half-written `.tmp` debris. Uploads ascending by TXID.
+async fn recover_staging(staging: &Path, client: &ReplicaClient) -> Result<(), SyncError> {
+    let level_dirs = match fs::read_dir(staging) {
+        Ok(d) => d,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut staged: Vec<(u32, u64, u64, PathBuf)> = Vec::new();
+    for level_dir in level_dirs {
+        let level_dir = level_dir?;
+        let Some(level) = level_dir
+            .file_name()
+            .to_str()
+            .and_then(|n| u32::from_str_radix(n, 16).ok())
+        else {
+            continue;
+        };
+        for entry in fs::read_dir(level_dir.path())? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.ends_with(".ltx.tmp") {
+                let _ = fs::remove_file(&path); // incomplete write
+            } else if let Some((min, max)) = crate::storage::parse_ltx_filename(&name) {
+                staged.push((level, min, max, path));
+            }
+        }
+    }
+
+    staged.sort_by_key(|&(level, min, max, _)| (min, max, level));
+    for (level, min, max, path) in staged {
+        upload_ltx_file(client, level, min, max, &path).await?;
+    }
+    Ok(())
 }
 
 fn wal_page(wal: &[u8], frame_offset: u64, page_size: usize) -> &[u8] {
@@ -955,10 +1162,112 @@ async fn apply_plan(
 }
 
 /// Reconstructs the latest database image from a replica's LTX chain.
+///
+/// Buffers the whole image in memory — convenient for tests and small
+/// databases. For anything large, prefer [`restore_to_path`], which streams to
+/// disk with O(page_size) resident memory.
 pub async fn restore(client: &ReplicaClient) -> Result<Vec<u8>, SyncError> {
     let files = list_all_levels(client).await?;
     let plan = plan_restore(&files)?;
     apply_plan(client, &plan).await
+}
+
+/// Reconstructs the latest database image straight onto disk at `path`,
+/// returning the TXID it reflects.
+///
+/// Unlike [`restore`], the full image is never held in memory: pages are
+/// `pwrite`-n into a pre-sized file as they decode, so resident memory is
+/// O(page_size) plus a `commit`-bit "already written" set (≈ 32 KB per 1 GB of
+/// database). Files are applied newest-first — the first writer of each page
+/// wins — so each hot page is written exactly once, not once per file that
+/// touched it.
+pub async fn restore_to_path(client: &ReplicaClient, path: &Path) -> Result<u64, SyncError> {
+    let files = list_all_levels(client).await?;
+    let plan = plan_restore(&files)?;
+    apply_plan_to_path(client, &plan, path).await
+}
+
+/// Applies a restore plan (files in ascending TXID order) directly to a file,
+/// newest-first with a page-dedup set. Returns the restored TXID.
+async fn apply_plan_to_path(
+    client: &ReplicaClient,
+    plan: &[(u32, u64, u64)],
+    path: &Path,
+) -> Result<u64, SyncError> {
+    // The newest file fixes the final database size (a VACUUM may have shrunk it
+    // below what an older file carried). One ranged GET of its 100-byte header.
+    let &(nl, nmin, nmax) = plan.last().ok_or(SyncError::NoSnapshot)?;
+    let head = client
+        .get_ltx_range(nl, nmin, nmax, 0, HEADER_SIZE as u64)
+        .await?;
+    let nh = Header::decode(&head)?;
+    let page_size = nh.page_size as usize;
+    let commit = nh.commit as usize;
+
+    // Pre-size the output; `set_len` zero-fills, which also covers any gaps (the
+    // lock page in >1 GiB databases is never encoded and stays zero).
+    let out = File::create(path)?;
+    out.set_len((commit * page_size) as u64)?;
+
+    let lock = lock_pgno(nh.page_size) as usize;
+    let mut written = vec![false; commit + 1]; // 1-indexed; [0] unused.
+    if (1..=commit).contains(&lock) {
+        written[lock] = true; // Leave the lock page zero-filled.
+    }
+
+    // Newest-first: the first file (going backwards) to carry a page holds its
+    // latest version. Decode each file page-by-page from its index — never
+    // materializing a whole file's pages — and pwrite the ones we haven't
+    // written yet. Handles both the LZ4 block and frame (litestream) formats.
+    for &(level, min, max) in plan.iter().rev() {
+        let bytes = client.get_ltx(level, min, max).await?;
+        for_each_indexed_page(&bytes, page_size, |pgno, data| {
+            let p = pgno as usize;
+            if (1..=commit).contains(&p) && !written[p] {
+                written[p] = true;
+                out.write_all_at(data, ((p - 1) * page_size) as u64)?;
+            }
+            Ok(())
+        })?;
+    }
+    out.sync_all()?;
+    Ok(nmax)
+}
+
+/// Decodes an LTX file's pages one at a time via its page index, invoking `f`
+/// with each `(pgno, page_data)`. Only one decompressed page is resident at a
+/// time — unlike [`read_file`], which returns every page at once.
+fn for_each_indexed_page(
+    bytes: &[u8],
+    page_size: usize,
+    mut f: impl FnMut(u32, &[u8]) -> Result<(), SyncError>,
+) -> Result<(), SyncError> {
+    let footer = INDEX_FOOTER_SIZE as usize;
+    if bytes.len() < HEADER_SIZE + footer {
+        return Err(SyncError::Ltx(crate::ltx::LtxError::ShortBuffer {
+            need: HEADER_SIZE + footer,
+            got: bytes.len(),
+        }));
+    }
+    let index_size_at = bytes.len() - footer;
+    let index_len =
+        u64::from_be_bytes(bytes[index_size_at..index_size_at + 8].try_into().unwrap()) as usize;
+    let index_start = index_size_at - index_len;
+    let index = decode_page_index(&bytes[index_start..index_size_at])?;
+
+    for elem in &index {
+        let start = elem.offset as usize;
+        let end = start + elem.size as usize;
+        if end > bytes.len() {
+            return Err(SyncError::Ltx(crate::ltx::LtxError::ShortBuffer {
+                need: end,
+                got: bytes.len(),
+            }));
+        }
+        let (ph, data) = decode_page_frame(&bytes[start..end], page_size)?;
+        f(ph.pgno, &data)?;
+    }
+    Ok(())
 }
 
 /// Restores the database as of `target_txid` (point-in-time recovery).

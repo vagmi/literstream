@@ -56,6 +56,14 @@ impl<W: Write> Encoder<W> {
         self.n
     }
 
+    /// Consumes the encoder, returning the underlying writer. [`finish`] has
+    /// already flushed it, so a `BufWriter` inner is safe to unwrap.
+    ///
+    /// [`finish`]: Encoder::finish
+    pub fn into_inner(self) -> W {
+        self.w
+    }
+
     /// Writes `b` to the underlying writer, feeding the file checksum.
     fn write_hashed(&mut self, b: &[u8]) -> Result<(), LtxError> {
         self.w.write_all(b)?;

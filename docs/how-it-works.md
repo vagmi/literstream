@@ -93,65 +93,79 @@ that changed. LTX files are named by their transaction range and are
 > byte-for-byte the same way, which is why the two tools can restore each other's
 > backups.
 
-## Step 5: Write to the object store atomically
+## Step 5: Stage locally, then write to the object store
 
-The LTX bytes are uploaded to the object store under a predictable key like
-`app/0000/<txid-range>.ltx` (the level as a 4-digit hex directory, matching
-litestream's remote layout). Two safety rules apply:
+literstream does not upload straight from memory. It first writes each LTX file to
+a local **staging directory** next to the database (`<db>-litestream/ltx/`) and
+fsyncs it there, then uploads it to the object store and deletes the local copy.
+Writing the file to disk first is what makes replication durable and lets a sync
+run independently of its upload. Step 6 explains why that matters.
 
-- **One writer.** literstream takes a host-local lock on the database file, so
-  two processes can't try to replicate the same database at once.
-- **Compare-and-swap.** Uploads use an **if-not-exists** conditional write. If a
-  file for that transaction range already exists, literstream compares bytes:
-  identical means it's a harmless retry; *different* means another writer
-  produced conflicting history ("split-brain") and literstream refuses to
-  overwrite it. This is the guarantee that a replica can't be
-  silently corrupted.
+The object store key is predictable, like `app/0000/<txid-range>.ltx`, with the
+level as a 4-digit hex directory that matches litestream's remote layout. Two
+safety rules apply to the upload:
 
-Replication position only advances *after* a successful upload, so a failed
-upload is simply retried from the same spot.
+- **One writer.** literstream takes a host-local lock on the database file, so two
+  processes can't try to replicate the same database at once.
+- **Compare-and-swap for small files.** Small uploads, which are the frequent
+  incrementals, use an if-not-exists conditional write. If a file for that
+  transaction range already exists, literstream compares bytes. Identical bytes
+  mean a harmless retry, and different bytes mean another writer produced
+  conflicting history, which is split-brain, and literstream refuses to overwrite
+  it. Large files, which are snapshots and compaction output, are streamed to the
+  object store in fixed-size parts with a multipart upload. That keeps memory
+  bounded but does not offer the conditional guarantee, so it is used only where a
+  single writer owns that transaction range.
+
+Replication position only advances after a successful upload, so a failed upload
+is simply retried from the same spot, and any file already staged is re-uploaded
+on the next start.
 
 ## Step 6: Checkpoint without leaving a gap
 
-Once the new frames are safely in the object store, literstream **checkpoints**
-the WAL, merging them into the main database file.
+literstream checkpoints the WAL to merge its frames into the main database file,
+and the *order* of operations is what keeps the backup whole. It stages the
+pending LTX to disk and fsyncs it first, then it checkpoints, then it uploads.
 
 Here's the subtle part. A non-blocking (PASSIVE) checkpoint runs alongside your
-writes, so it can merge a *just-committed* frame into the main file before
-literstream has replicated it. Once the WAL resets, that frame lives only in the
-DB file, invisible to the next incremental read. A silent hole. (A real bug we
-hit.)
+writes, so it can merge a just-committed frame into the main file before
+literstream has copied it out. Once the WAL resets, that frame lives only in the
+database file, invisible to the next incremental read. That is a silent hole, and
+it was a real bug we hit.
 
-literstream follows Litestream's rule here: **never stall the writer on the happy
-path.** So instead of *excluding* the race, it *notices* it. Around a checkpoint
-it does three things:
+literstream follows Litestream's rule here: never stall the writer on the happy
+path. So instead of excluding the race, it makes the frames durable before the
+checkpoint can touch them, and it notices the one case it cannot prevent.
 
-1. **Capture first, upload later (a shadow).** It builds the pending LTX from the
-   WAL (a fast, local step) *before* checkpointing, and holds those bytes in
-   memory. Then it checkpoints, then it uploads. Because the captured frames
-   outlive the WAL reset (we're holding them), the checkpoint can't lose them, and
-   the only window where a frame could slip past unrecorded shrinks from a network
-   upload down to a local build.
+1. **Stage before checkpoint.** literstream writes the pending LTX to the local
+   staging directory and fsyncs it before it checkpoints. Because that file is on
+   disk before the checkpoint merges its frames into the main database, a crash or
+   a WAL reset can no longer lose them. On the next start literstream re-uploads
+   any staged file it finds, which recovers the exact frames without re-reading the
+   whole database.
 2. **Restart the WAL (seq-bump).** Right after a PASSIVE checkpoint that drained
-   the WAL, while no read-mark is held to block it, it writes one row to
-   `_literstream_seq`, forcing SQLite to *restart* the WAL into a fresh generation
-   (reusing the file instead of extending it) and seeding a real frame for the next
-   read-mark to pin.
-3. **Detect the rest.** It still compares what the checkpoint merged into the DB
-   against what it captured; if a write did land in that tiny window, the next sync
-   **re-snapshots** from the DB to recover it. Correctness by noticing, never a
-   stall.
+   the WAL, while no read-mark is held to block it, literstream writes one row to
+   `_literstream_seq`. That forces SQLite to restart the WAL into a fresh
+   generation, reusing the file instead of extending it, and it seeds a real frame
+   for the next read-mark to pin.
+3. **Catch the race.** literstream compares what the checkpoint merged into the
+   database against what it captured. If a write did land in that tiny window, its
+   frames are now only in the database file, so literstream stages a catch-up
+   snapshot from the database right away and uploads it. That snapshot is durable
+   too, and the `Driver` reports the event as `resnapshot_fired`. This is
+   correctness by noticing, never a stall.
 
-The capture-first step makes those re-snapshots *rare* (only a write in the
-build-sized window), not one per checkpoint.
+Staging the file before the checkpoint closes the crash window, and the catch-up
+snapshots stay rare because they only happen when a write beats the checkpoint.
 
-> **Trade-off, stated honestly.** This is Litestream's cost profile: the app is
-> never blocked, and the price is a rare re-snapshot when a checkpoint outruns
-> replication. The shadow here is *in-memory* (it covers a single checkpoint, not
-> a process restart); under *sustained* writes PASSIVE keeps returning busy and the
-> WAL can still grow on disk (Litestream has the same property, so monitor disk),
-> resetting in idle windows. A *persistent* shadow WAL would also survive restarts,
-> a further step this port doesn't take.
+> **Trade-off, stated honestly.** This is Litestream's cost profile. The
+> application is never blocked, and the price is a rare catch-up snapshot when a
+> checkpoint outruns replication, plus one fsync per sync for the staged file.
+> Because staging lives on disk rather than in memory, the durability now survives
+> a process restart, which the earlier in-memory design did not. Under sustained
+> writes PASSIVE keeps returning busy and the WAL can still grow on disk, and a
+> large blocking TRUNCATE checkpoint acts as an emergency brake in that case, so
+> monitor disk usage.
 
 ## Step 7: Compaction
 
@@ -199,6 +213,9 @@ The result is a byte-perfect database file you can open directly.
 - **By transaction:** `restore_to_txid(n)` as of a specific commit.
 - **By time:** `restore_to_timestamp(ms)` snaps to the newest transaction at or
   before a wall-clock instant.
+- **Straight to disk:** `restore_to_path()` writes the rebuilt database to a file
+  one page at a time, so restoring a large database never holds the whole image in
+  memory.
 
 There's also a `ReplicaReader` that fetches *individual pages* straight from the
 replica with ranged reads. This is what enables reading a database directly from
@@ -210,8 +227,9 @@ You could call each step yourself, but the `Driver` runs the whole schedule from
 a single `tick(now)`:
 
 ```
-each tick:  sync → checkpoint (if WAL is big) → compact levels (on their intervals)
-            → snapshot (on its interval) → enforce retention
+each tick:  sync → checkpoint (when the WAL is big enough or on a time interval)
+            → compact levels (on their intervals) → snapshot (on its interval)
+            → enforce retention
 ```
 
 Give it a wall-clock time and it does the right thing on the right cadence, the

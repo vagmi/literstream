@@ -9,7 +9,8 @@ use std::time::Duration;
 use literstream::db::{CheckpointMode, Db};
 use literstream::storage::ReplicaClient;
 use literstream::sync::{
-    ReplicaReader, SyncError, SyncOutcome, Syncer, restore, restore_to_timestamp, restore_to_txid,
+    ReplicaReader, SyncError, SyncOutcome, Syncer, restore, restore_to_path, restore_to_timestamp,
+    restore_to_txid,
 };
 use object_store::memory::InMemory;
 use rusqlite::Connection;
@@ -636,4 +637,217 @@ async fn driver_compacts_during_workload_and_preserves_pitr() {
     }
     let image = restore(&client).await.unwrap();
     assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 120));
+}
+
+/// literstream's local staging root for a database (`<db>-litestream/ltx`).
+fn staging_root(db_path: &PathBuf) -> PathBuf {
+    let mut p = db_path.clone().into_os_string();
+    p.push("-litestream");
+    PathBuf::from(p).join("ltx")
+}
+
+/// The L0 staged `.ltx` path for a TXID.
+fn staged_l0(db_path: &PathBuf, txid: u64) -> PathBuf {
+    staging_root(db_path)
+        .join("0000")
+        .join(format!("{txid:016x}-{txid:016x}.ltx"))
+}
+
+#[tokio::test]
+async fn restore_to_path_matches_full_restore() {
+    let tc = TempCase::new("restorepath");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+
+    // A snapshot + several incrementals, then a cascade + snapshot so the plan
+    // spans multiple levels (exercises newest-first dedup across files).
+    for b in 0..5 {
+        insert_range(&w, b * 20 + 1, b * 20 + 21, "batch");
+        syncer.sync().await.unwrap();
+    }
+    syncer.compact_level(1).await.unwrap().unwrap();
+    syncer.snapshot().await.unwrap().unwrap();
+    insert_range(&w, 101, 141, "after");
+    syncer.sync().await.unwrap();
+
+    // The streamed-to-disk restore is byte-identical to the in-memory one.
+    let in_memory = restore(&client).await.unwrap();
+    let out = tc.dir.join("streamed.db");
+    let txid = restore_to_path(&client, &out).await.unwrap();
+    let on_disk = std::fs::read(&out).unwrap();
+    assert_eq!(on_disk, in_memory, "streamed restore differs from in-memory");
+
+    // ...and it is a valid, live database at the latest txid.
+    assert_eq!(validate_image(&tc.dir, &on_disk), ("ok".into(), 140));
+    let latest = client
+        .list_ltx(0)
+        .await
+        .unwrap()
+        .iter()
+        .map(|f| f.max_txid)
+        .max()
+        .unwrap();
+    assert_eq!(txid, latest, "restore_to_path returns the restored txid");
+}
+
+/// Crash between staging and upload: an fsync'd `.ltx` is left in the staging
+/// dir. On reopen, `recover_staging` must re-upload it (exact frames, no
+/// re-snapshot) and remove the local copy.
+#[tokio::test]
+async fn crash_before_upload_recovers_from_staging() {
+    let tc = TempCase::new("staging-recover");
+    let client = memory_client();
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+
+    // Normal replication: snapshot(1) + incrementals(2,3), all uploaded.
+    {
+        let db = Db::open(&tc.db_path).unwrap();
+        let mut s = Syncer::open(db, client.clone()).await.unwrap();
+        for b in 0..3 {
+            insert_range(&w, b * 20 + 1, b * 20 + 21, "x");
+            s.sync().await.unwrap();
+        }
+    }
+
+    // Reconstruct the crash state: txid 3 was staged but never shipped. Capture
+    // its bytes, remove it from the replica, and drop it back into staging.
+    let bytes = client.get_ltx(0, 3, 3).await.unwrap();
+    client.delete_ltx(0, 3, 3).await.unwrap();
+    let staged = staged_l0(&tc.db_path, 3);
+    std::fs::create_dir_all(staged.parent().unwrap()).unwrap();
+    std::fs::write(&staged, &bytes).unwrap();
+    assert!(client.get_ltx(0, 3, 3).await.is_err(), "replica missing txid 3");
+
+    // Reopen: recovery re-uploads the staged file before deriving position.
+    {
+        let db = Db::open(&tc.db_path).unwrap();
+        let _s = Syncer::open(db, client.clone()).await.unwrap();
+    }
+    assert!(
+        client.get_ltx(0, 3, 3).await.is_ok(),
+        "staged file re-uploaded on open"
+    );
+    assert!(!staged.exists(), "staged file removed after upload");
+
+    let image = restore(&client).await.unwrap();
+    assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 60));
+}
+
+/// A half-written `.ltx.tmp` from a crash mid-encode is deleted on open.
+#[tokio::test]
+async fn tmp_debris_is_cleaned_on_open() {
+    let tc = TempCase::new("staging-tmp");
+    let client = memory_client();
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+    {
+        let db = Db::open(&tc.db_path).unwrap();
+        let mut s = Syncer::open(db, client.clone()).await.unwrap();
+        insert_range(&w, 1, 21, "x");
+        s.sync().await.unwrap();
+    }
+
+    let mut tmp = staged_l0(&tc.db_path, 9).into_os_string();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
+    std::fs::create_dir_all(tmp.parent().unwrap()).unwrap();
+    std::fs::write(&tmp, b"half-written garbage").unwrap();
+
+    {
+        let db = Db::open(&tc.db_path).unwrap();
+        let _s = Syncer::open(db, client.clone()).await.unwrap();
+    }
+    assert!(!tmp.exists(), ".tmp debris removed on open");
+}
+
+/// A clean sync + checkpoint cycle leaves the staging dir empty (files are
+/// removed after upload) — no accumulation, no re-upload on restart.
+#[tokio::test]
+async fn clean_cycle_leaves_empty_staging() {
+    let tc = TempCase::new("staging-clean");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
+    syncer.min_checkpoint_frames = 1; // force a checkpoint on the next tick
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+    insert_range(&w, 1, 201, "x");
+    syncer.sync().await.unwrap();
+    syncer.checkpoint_if_needed().await.unwrap();
+
+    let leftover: Vec<_> = walkdir_ltx(&staging_root(&tc.db_path));
+    assert!(
+        leftover.is_empty(),
+        "staging should be empty after a clean cycle, found {leftover:?}"
+    );
+    let image = restore(&client).await.unwrap();
+    assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 200));
+}
+
+/// Collects any `.ltx`/`.ltx.tmp` files remaining under a staging root.
+fn walkdir_ltx(root: &PathBuf) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(levels) = std::fs::read_dir(root) else {
+        return out;
+    };
+    for lvl in levels.flatten() {
+        if let Ok(files) = std::fs::read_dir(lvl.path()) {
+            for f in files.flatten() {
+                let name = f.file_name();
+                if name.to_string_lossy().contains(".ltx") {
+                    out.push(f.path());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A low-write database never crosses the frame threshold, but the time-based
+/// checkpoint still folds its WAL (so restores stay cheap) — and it does not
+/// re-checkpoint before the interval elapses. Exercises the #997 logical-offset
+/// gate and the observability fields.
+#[tokio::test]
+async fn time_based_checkpoint_folds_a_low_write_wal() {
+    use literstream::sync::{CompactionLevels, Driver};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let tc = TempCase::new("time-ckpt");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let syncer = Syncer::open(db, client.clone()).await.unwrap();
+    // Default frame threshold (1000) is far above a handful of rows, so only the
+    // time-based checkpoint can fire. Snapshots off to keep the assertions clean.
+    let mut driver = Driver::new(syncer, CompactionLevels::default())
+        .with_checkpoint_interval(Duration::from_secs(60))
+        .with_snapshot_interval(Duration::ZERO);
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+    insert_range(&w, 1, 6, "x"); // 5 rows — nowhere near 1000 frames
+
+    let base = UNIX_EPOCH + Duration::from_secs(10_000);
+    let r0 = driver.tick(base).await.unwrap();
+    assert!(
+        r0.checkpoint.is_some(),
+        "time-based checkpoint should fold a low-write WAL"
+    );
+    assert!(!r0.resnapshot_fired, "a clean checkpoint takes no fallback snapshot");
+    assert_eq!(r0.staged_backlog_bytes, 0, "nothing left staged after upload");
+
+    // Before the interval elapses, no further checkpoint.
+    let r1 = driver.tick(base + Duration::from_secs(5)).await.unwrap();
+    assert!(
+        r1.checkpoint.is_none(),
+        "no checkpoint before the interval elapses"
+    );
+
+    let image = restore(&client).await.unwrap();
+    assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 5));
 }
