@@ -30,7 +30,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use literstream::db::{CheckpointMode, Db};
+use literstream::db::Db;
 use literstream::storage::ReplicaClient;
 use literstream::sync::{
     CompactionLevel, CompactionLevels, Driver, Syncer, restore, restore_to_timestamp,
@@ -94,9 +94,8 @@ async fn main() {
         .with_snapshot_interval(Duration::from_secs(60))
         .with_snapshot_retention(Duration::from_secs(24 * 60 * 60))
         .with_l0_retention(Duration::from_secs(90));
-    // Tune checkpoints down so they fire during a short demo (defaults 1000/10000).
+    // Tune the checkpoint threshold down so it fires during a short demo.
     driver.syncer_mut().min_checkpoint_frames = 200;
-    driver.syncer_mut().truncate_frames = 2000;
 
     // The application writer — a separate connection, as in real usage.
     let writer = Connection::open(&db_path).unwrap();
@@ -137,8 +136,8 @@ async fn main() {
         if report.l0_pruned > 0 {
             println!("  t+{t:>3}s  retention pruned {} L0 file(s)", report.l0_pruned);
         }
-        if let Some((CheckpointMode::Truncate, res)) = &report.checkpoint {
-            println!("  t+{t:>3}s  TRUNCATE checkpoint ({} frames)", res.log_frames);
+        if let Some((mode, res)) = &report.checkpoint {
+            println!("  t+{t:>3}s  checkpoint {mode:?} ({} frames)", res.log_frames);
         }
 
         if elapsed - last_mark >= MARK_INTERVAL {

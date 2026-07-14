@@ -163,9 +163,8 @@ async fn survives_truncate_checkpoint_and_new_generation() {
     let db = Db::open(&tc.db_path).unwrap();
     let client = memory_client();
     let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
-    // Aggressive thresholds so a checkpoint fires after the first batch.
+    // Aggressive threshold so a checkpoint fires after the first batch.
     syncer.min_checkpoint_frames = 2;
-    syncer.truncate_frames = 2;
 
     let w = writer(&tc.db_path);
     ensure_table(&w);
@@ -176,19 +175,20 @@ async fn survives_truncate_checkpoint_and_new_generation() {
         SyncOutcome::Snapshot { txid: 1, .. }
     ));
 
-    // Sync captured everything; now truncate the WAL (new generation follows).
-    let ckpt = syncer.checkpoint_if_needed().unwrap();
-    assert!(matches!(ckpt, Some((CheckpointMode::Truncate, _))));
-    assert_eq!(syncer.db().wal_size(), 0);
+    // Sync captured everything; now checkpoint (PASSIVE under a write lock, which
+    // restarts the WAL into a new generation).
+    let ckpt = syncer.checkpoint_if_needed().await.unwrap();
+    assert!(matches!(ckpt, Some((CheckpointMode::Passive, _))));
 
-    // New writes land in a fresh WAL generation (new salts). A TRUNCATE blocks
-    // writers, so no frames were checkpointed behind our back: the syncer takes
-    // the cheap incremental-after-reset path, not a full re-snapshot.
+    // New writes land in a fresh WAL generation (new salts). Because the
+    // checkpoint ran under a write lock after a final sync, no frames were
+    // checkpointed behind our back: the syncer takes the cheap
+    // incremental-after-reset path, not a full re-snapshot.
     insert_range(&w, 201, 301, "second");
     let outcome = syncer.sync().await.unwrap();
     assert!(
         matches!(outcome, SyncOutcome::Incremental { .. }),
-        "expected incremental after truncate reset, got {outcome:?}"
+        "expected incremental after WAL reset, got {outcome:?}"
     );
 
     let image = restore(&client).await.unwrap();

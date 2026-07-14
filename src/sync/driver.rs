@@ -130,19 +130,12 @@ impl Driver {
 
     /// Runs one scheduler step at wall-clock instant `now`.
     pub async fn tick(&mut self, now: SystemTime) -> Result<TickReport, SyncError> {
-        // 1. Drain all pending frames, then checkpoint if the WAL is large
-        //    enough. Draining first means a checkpoint only sees frames we've
-        //    already replicated, so the common case takes the cheap
-        //    incremental-after-reset path rather than a full re-snapshot.
-        let mut synced = SyncOutcome::Skipped;
-        loop {
-            let outcome = self.syncer.sync().await?;
-            if outcome == SyncOutcome::Skipped {
-                break;
-            }
-            synced = outcome;
-        }
-        let checkpoint = self.syncer.checkpoint_if_needed()?;
+        // 1. Replicate new frames (one sync captures all committed frames to the
+        //    current WAL end), then checkpoint if the WAL has grown enough. If a
+        //    non-blocking checkpoint races the writer, the gap is detected and the
+        //    next sync re-snapshots (see `checkpoint_if_needed`).
+        let synced = self.syncer.sync().await?;
+        let checkpoint = self.syncer.checkpoint_if_needed().await?;
 
         // 2. Level-to-level compaction, once per interval boundary per level.
         let mut compactions = Vec::new();

@@ -18,6 +18,9 @@
 //! real litestream binary restores our replicas and we restore its.
 
 use std::fs;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
@@ -29,7 +32,9 @@ use crate::ltx::{
     read_file,
 };
 use crate::storage::{PutOutcome, ReplicaClient};
-use crate::wal::{PageMap, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalHeader, WalReader};
+use crate::wal::{
+    PageMap, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalError, WalFrameHeader, WalHeader, WalReader,
+};
 
 mod driver;
 mod error;
@@ -44,10 +49,8 @@ pub use error::SyncError;
 pub use level::{CompactionLevel, CompactionLevels, SNAPSHOT_LEVEL};
 pub use reader::ReplicaReader;
 
-/// Default WAL-frame threshold for a PASSIVE checkpoint (~4 MB @ 4 KB).
+/// Default WAL-frame growth before a checkpoint (~4 MB @ 4 KB).
 pub const DEFAULT_MIN_CHECKPOINT_FRAMES: u64 = 1000;
-/// Default WAL-frame threshold for an emergency TRUNCATE checkpoint.
-pub const DEFAULT_TRUNCATE_FRAMES: u64 = 10_000;
 
 /// L0 is the raw, uncompacted level.
 const LEVEL0: u32 = 0;
@@ -111,21 +114,13 @@ pub struct Syncer {
     pos: Position,
     /// Held for the syncer's lifetime to enforce a single host-local writer.
     _lock: ProcessLock,
-    /// PASSIVE checkpoint when the WAL grows this many frames past the last
-    /// checkpoint.
+    /// Checkpoint when the WAL grows this many frames past the last checkpoint.
     pub min_checkpoint_frames: u64,
-    /// TRUNCATE checkpoint at this many frames (0 disables).
-    pub truncate_frames: u64,
     /// WAL frame count (file high-water) right after the last checkpoint. PASSIVE
     /// checkpoints don't truncate the `-wal` file, so `wal_frame_count()` reflects
     /// the high-water, not live frames; we gate the next PASSIVE on growth beyond
     /// this baseline to avoid checkpointing (and re-snapshotting) every tick.
     checkpoint_baseline_frames: u64,
-    /// Set when a checkpoint moved more frames into the DB than we had synced —
-    /// i.e. it checkpointed frames we hadn't replicated yet, which now live only
-    /// in the DB file. The next sync must re-snapshot (not incremental) to
-    /// recover them. Cleared once that snapshot succeeds.
-    pending_resync: bool,
 }
 
 impl Syncer {
@@ -148,9 +143,7 @@ impl Syncer {
             pos,
             _lock: lock,
             min_checkpoint_frames: DEFAULT_MIN_CHECKPOINT_FRAMES,
-            truncate_frames: DEFAULT_TRUNCATE_FRAMES,
             checkpoint_baseline_frames: 0,
-            pending_resync: false,
         })
     }
 
@@ -199,79 +192,85 @@ impl Syncer {
             PutOutcome::Conflict => return Err(SyncError::Equivocation { txid: b.max_txid }),
         }
 
-        // A snapshot re-reads the whole DB, so it recovers any frames a prior
-        // checkpoint moved out of the WAL — the resync is satisfied.
-        if matches!(b.outcome, SyncOutcome::Snapshot { .. }) {
-            self.pending_resync = false;
-        }
-
         self.pos = b.new_pos;
         Ok(b.outcome)
     }
 
     /// Reads the WAL/DB and builds the next LTX file (no network I/O).
+    ///
+    /// The frequent incremental path reads only the WAL *tail* (`[offset..]`),
+    /// not the whole file, so per-sync memory is bounded to the new frames. Only
+    /// the rare snapshot path reads the whole WAL (and DB).
     fn build_under_lock(&self) -> Result<Option<BuiltFile>, SyncError> {
-        let mut wal_path = self.db.path().to_path_buf().into_os_string();
-        wal_path.push("-wal");
-        let wal = fs::read(&wal_path).unwrap_or_default();
+        let mut p = self.db.path().to_path_buf().into_os_string();
+        p.push("-wal");
+        let wal_path = std::path::PathBuf::from(p);
 
-        match self.plan(&wal)? {
+        let wal_len = fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
+        let header = if wal_len >= WAL_HEADER_SIZE as u64 {
+            let mut hbuf = [0u8; WAL_HEADER_SIZE];
+            read_exact_at(&wal_path, 0, &mut hbuf)?;
+            Some(WalHeader::parse(&hbuf)?)
+        } else {
+            None
+        };
+
+        match self.plan(wal_len, header.as_ref()) {
             Plan::Skip => Ok(None),
-            Plan::Snapshot { offset } => Ok(Some(self.build_snapshot(offset, &wal)?)),
+            Plan::Snapshot { offset } => {
+                // Rare (first sync): read the whole WAL for the snapshot.
+                let wal = fs::read(&wal_path).unwrap_or_default();
+                Ok(Some(self.build_snapshot(offset, &wal)?))
+            }
             Plan::Incremental {
                 offset,
                 salt1,
                 salt2,
-            } => self.build_incremental(offset, salt1, salt2, &wal),
+            } => {
+                // `header` is always `Some` here (plan only returns Incremental
+                // when the WAL has a header).
+                let header = header.expect("incremental plan implies a WAL header");
+                self.build_incremental(offset, salt1, salt2, wal_len, header, &wal_path)
+            }
         }
     }
 
-    fn plan(&self, wal: &[u8]) -> Result<Plan, SyncError> {
+    fn plan(&self, wal_len: u64, header: Option<&WalHeader>) -> Plan {
         if self.pos.txid == 0 {
-            return Ok(Plan::Snapshot {
+            return Plan::Snapshot {
                 offset: WAL_HEADER_SIZE as u64,
-            });
+            };
         }
-        if wal.len() < WAL_HEADER_SIZE {
-            return Ok(if self.pos.synced_to_wal_end {
+        let Some(header) = header else {
+            return if self.pos.synced_to_wal_end {
                 Plan::Skip
             } else {
                 Plan::Snapshot {
                     offset: WAL_HEADER_SIZE as u64,
                 }
-            });
-        }
+            };
+        };
 
-        let header = WalHeader::parse(wal)?;
-        let wal_size = wal.len() as u64;
         let salt_match = (header.salt1, header.salt2) == (self.pos.salt1, self.pos.salt2);
 
         // A new WAL generation (salt change) or a shrunk WAL means a checkpoint
-        // restarted the log. If that checkpoint moved frames we hadn't synced yet
-        // ([`Self::pending_resync`]), those frames now live only in the DB file, so
-        // we must re-snapshot from the DB to capture them — an incremental would
-        // see only the new generation and silently drop them, corrupting the
-        // restore. Otherwise (the common case: we'd fully drained before the
-        // checkpoint) a cheap incremental from the new generation is correct.
-        if self.pos.wal_offset > wal_size || !salt_match {
-            return Ok(if self.pending_resync {
-                Plan::Snapshot {
-                    offset: WAL_HEADER_SIZE as u64,
-                }
-            } else {
-                Plan::Incremental {
-                    offset: WAL_HEADER_SIZE as u64,
-                    salt1: header.salt1,
-                    salt2: header.salt2,
-                }
-            });
+        // restarted the log. Because checkpoints run under a write lock after a
+        // final sync (see `checkpoint_if_needed`), every frame from the old
+        // generation is already in the LTX chain, so we can safely continue with
+        // a cheap incremental from the start of the new generation.
+        if self.pos.wal_offset > wal_len || !salt_match {
+            return Plan::Incremental {
+                offset: WAL_HEADER_SIZE as u64,
+                salt1: header.salt1,
+                salt2: header.salt2,
+            };
         }
 
-        Ok(Plan::Incremental {
+        Plan::Incremental {
             offset: self.pos.wal_offset,
             salt1: self.pos.salt1,
             salt2: self.pos.salt2,
-        })
+        }
     }
 
     fn build_snapshot(&self, offset: u64, wal: &[u8]) -> Result<BuiltFile, SyncError> {
@@ -337,7 +336,10 @@ impl Syncer {
                 wal_offset: offset + wal_size,
                 salt1,
                 salt2,
-                synced_to_wal_end: offset + wal_size == wal.len() as u64,
+                // `>=` (not `==`): an empty/truncated WAL (len < header) still
+                // means we've captured everything (it's all in the DB now), so
+                // the next sync skips instead of re-snapshotting forever.
+                synced_to_wal_end: offset + wal_size >= wal.len() as u64,
             },
         })
     }
@@ -347,10 +349,32 @@ impl Syncer {
         offset: u64,
         salt1: u32,
         salt2: u32,
-        wal: &[u8],
+        wal_len: u64,
+        header: WalHeader,
+        wal_path: &Path,
     ) -> Result<Option<BuiltFile>, SyncError> {
         let page_size = self.db.page_size() as usize;
-        let page_map = WalReader::new_at_offset(wal, offset)?.page_map();
+        let frame_size = WAL_FRAME_HEADER_SIZE as u64 + page_size as u64;
+
+        // Seed the running checksum from the frame ending at `offset` (the header
+        // when starting at the first frame). This lets us verify the tail without
+        // reading the frames before `offset`.
+        let seed = if offset <= WAL_HEADER_SIZE as u64 {
+            (header.checksum1, header.checksum2)
+        } else {
+            let mut fbuf = [0u8; WAL_FRAME_HEADER_SIZE];
+            read_exact_at(wal_path, offset - frame_size, &mut fbuf)?;
+            let ph = WalFrameHeader::parse(&fbuf);
+            if ph.salt1 != header.salt1 || ph.salt2 != header.salt2 {
+                return Err(SyncError::Wal(WalError::PrevFrameMismatch));
+            }
+            (ph.checksum1, ph.checksum2)
+        };
+
+        // Read only the new frames (`[offset..]`), not the whole WAL.
+        let tail = read_tail(wal_path, offset)?;
+        let mut reader = WalReader::from_tail(header, &tail, offset, seed)?;
+        let page_map = reader.page_map();
         if page_map.pages.is_empty() {
             return Ok(None);
         }
@@ -375,7 +399,7 @@ impl Syncer {
                 salt2,
             ))?;
             for &pgno in &pgnos {
-                let data = wal_page(wal, page_map.pages[&pgno], page_size);
+                let data = reader.page_data_at(page_map.pages[&pgno]);
                 enc.encode_page(pgno, data)?;
             }
             enc.finish()?;
@@ -395,47 +419,47 @@ impl Syncer {
                 wal_offset: final_offset,
                 salt1,
                 salt2,
-                synced_to_wal_end: final_offset == wal.len() as u64,
+                synced_to_wal_end: final_offset >= wal_len,
             },
         }))
     }
 
-    /// Applies the checkpoint strategy based on WAL growth. Sync before calling
-    /// this so the frames being checkpointed are already stored.
+    /// Checkpoints the WAL when it has grown enough, under a brief write lock so
+    /// the checkpoint can't move frames we haven't replicated yet.
     ///
-    /// PASSIVE fires only once the WAL has grown `min_checkpoint_frames` past the
-    /// previous checkpoint (not on absolute size): a PASSIVE checkpoint reuses the
-    /// `-wal` file in place without shrinking it, so gating on absolute size would
-    /// re-checkpoint every tick — and each checkpoint restarts the WAL (new salt),
-    /// forcing a full re-snapshot. TRUNCATE remains an absolute emergency brake.
-    pub fn checkpoint_if_needed(
+    /// The write lock (a second connection's `BEGIN IMMEDIATE`) freezes
+    /// application writes; a final sync then uploads every committed frame, so
+    /// once the checkpoint runs, everything it folds into the DB is already in
+    /// the LTX chain (the durable "shadow"). A WAL reset therefore needs no
+    /// re-snapshot — the next sync continues incrementally. PASSIVE fires on WAL
+    /// *growth* past the previous checkpoint (a PASSIVE checkpoint reuses the
+    /// `-wal` in place without shrinking it, so absolute size would re-checkpoint
+    /// every tick); TRUNCATE is an absolute emergency brake.
+    pub async fn checkpoint_if_needed(
         &mut self,
     ) -> Result<Option<(CheckpointMode, CheckpointResult)>, SyncError> {
         let frames = self.db.wal_frame_count();
-        let grown = frames.saturating_sub(self.checkpoint_baseline_frames);
-        let mode = if self.truncate_frames > 0 && frames >= self.truncate_frames {
-            CheckpointMode::Truncate
-        } else if grown >= self.min_checkpoint_frames {
-            CheckpointMode::Passive
-        } else {
+        if frames.saturating_sub(self.checkpoint_baseline_frames) < self.min_checkpoint_frames {
             return Ok(None);
-        };
-        // Frames we've replicated so far in the current WAL generation. If the
-        // checkpoint moves more than this into the DB, it captured frames we
-        // hadn't synced (a non-blocking PASSIVE racing the writer) — flag the next
-        // sync to re-snapshot from the DB. Drain (flush) before calling this so
-        // the common, caught-up case is detected as no-gap.
-        let frame_size = WAL_FRAME_HEADER_SIZE as u64 + self.db.page_size() as u64;
-        let synced_frames = self
-            .pos
-            .wal_offset
-            .saturating_sub(WAL_HEADER_SIZE as u64)
-            / frame_size;
-
-        let result = self.db.checkpoint(mode)?;
-        if result.checkpointed_frames as u64 > synced_frames {
-            self.pending_resync = true;
         }
+        // Always PASSIVE: run under our write lock (below) with no concurrent
+        // writers and our read-mark released, a PASSIVE checkpoint fully drains
+        // and restarts the WAL — so we never need TRUNCATE (which would deadlock
+        // against the write lock we hold).
+        let mode = CheckpointMode::Passive;
+
+        // Freeze writers, drain the last committed frames, then checkpoint. The
+        // write lock guarantees nothing new commits in between, so the checkpoint
+        // never moves an un-replicated frame.
+        self.db.acquire_write_lock()?;
+        let synced = self.sync().await;
+        let checkpointed = match synced {
+            Ok(_) => self.db.checkpoint(mode).map_err(SyncError::from),
+            Err(e) => Err(e),
+        };
+        let _ = self.db.release_write_lock();
+        let result = checkpointed?;
+
         // Rebaseline to the post-checkpoint high-water so the next PASSIVE waits
         // for genuine new growth.
         self.checkpoint_baseline_frames = self.db.wal_frame_count();
@@ -724,6 +748,24 @@ fn now_ms() -> i64 {
 fn wal_page(wal: &[u8], frame_offset: u64, page_size: usize) -> &[u8] {
     let start = frame_offset as usize + WAL_FRAME_HEADER_SIZE;
     &wal[start..start + page_size]
+}
+
+/// Reads exactly `buf.len()` bytes at `offset` from a file (for the WAL header
+/// or a single frame header).
+fn read_exact_at(path: &Path, offset: u64, buf: &mut [u8]) -> Result<(), SyncError> {
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.read_exact(buf)?;
+    Ok(())
+}
+
+/// Reads a file from `offset` to EOF — the WAL tail of new frames.
+fn read_tail(path: &Path, offset: u64) -> Result<Vec<u8>, SyncError> {
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 /// A litestream-compatible LTX header: checksum tracking disabled

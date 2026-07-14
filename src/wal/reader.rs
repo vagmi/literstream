@@ -42,8 +42,15 @@ pub struct PageMap {
 }
 
 /// A reader over an in-memory WAL buffer.
+///
+/// `data` normally holds the whole WAL (`base == 0`, so `data[0..32]` is the
+/// header). For bounded-memory tail reads, `data` may instead hold only the WAL
+/// bytes from absolute offset `base` onward (a frame boundary); the header is
+/// then supplied separately (see [`WalReader::from_tail`]).
 pub struct WalReader<'a> {
     data: &'a [u8],
+    /// Absolute WAL offset that `data[0]` corresponds to (0 for a full buffer).
+    base: u64,
     header: WalHeader,
     frame_n: usize,
     /// Running checksum carried from the previous frame (header seeds it).
@@ -56,9 +63,35 @@ impl<'a> WalReader<'a> {
         let header = WalHeader::parse(data)?;
         Ok(WalReader {
             data,
+            base: 0,
             header,
             frame_n: 0,
             chksum: (header.checksum1, header.checksum2),
+        })
+    }
+
+    /// Opens a reader over a WAL *tail*: `data` holds the WAL bytes starting at
+    /// absolute offset `base` (a frame boundary), `header` is the WAL header
+    /// (read separately), and `seed` is the running checksum of the frame ending
+    /// at `base` (the header's checksums when `base == WAL_HEADER_SIZE`). This
+    /// lets a sync read only the new frames instead of the whole WAL.
+    pub fn from_tail(
+        header: WalHeader,
+        data: &'a [u8],
+        base: u64,
+        seed: (u32, u32),
+    ) -> Result<WalReader<'a>, WalError> {
+        let frame_size = (WAL_FRAME_HEADER_SIZE + header.page_size as usize) as u64;
+        let ho = WAL_HEADER_SIZE as u64;
+        if base < ho || (base - ho) % frame_size != 0 {
+            return Err(WalError::UnalignedOffset(base));
+        }
+        Ok(WalReader {
+            data,
+            base,
+            header,
+            frame_n: ((base - ho) / frame_size) as usize,
+            chksum: seed,
         })
     }
 
@@ -97,6 +130,7 @@ impl<'a> WalReader<'a> {
 
         Ok(WalReader {
             data,
+            base: 0,
             header,
             frame_n,
             chksum,
@@ -111,9 +145,10 @@ impl<'a> WalReader<'a> {
         self.header.page_size
     }
 
-    /// Returns the page payload for a frame whose header starts at `offset`.
+    /// Returns the page payload for a frame whose header starts at absolute WAL
+    /// offset `offset`.
     pub fn page_data_at(&self, offset: u64) -> &'a [u8] {
-        let start = offset as usize + WAL_FRAME_HEADER_SIZE;
+        let start = (offset - self.base) as usize + WAL_FRAME_HEADER_SIZE;
         &self.data[start..start + self.header.page_size as usize]
     }
 
@@ -122,7 +157,10 @@ impl<'a> WalReader<'a> {
     pub fn read_frame(&mut self) -> Option<Frame<'a>> {
         let page_size = self.header.page_size as usize;
         let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
-        let offset = WAL_HEADER_SIZE + self.frame_n * frame_size;
+        // Absolute WAL offset of this frame's header, and its index into `data`
+        // (which starts at `self.base`).
+        let abs = WAL_HEADER_SIZE + self.frame_n * frame_size;
+        let offset = abs - self.base as usize;
 
         // Copy the slice reference out so the returned frame borrows the
         // underlying buffer ('a), not `self`.
@@ -154,7 +192,7 @@ impl<'a> WalReader<'a> {
         Some(Frame {
             pgno: hdr.pgno,
             commit: hdr.commit,
-            offset: offset as u64,
+            offset: abs as u64,
             data: page,
         })
     }

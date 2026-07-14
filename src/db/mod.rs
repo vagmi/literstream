@@ -74,10 +74,15 @@ impl CheckpointResult {
 /// A literstream-managed handle to a SQLite database.
 pub struct Db {
     conn: Connection,
+    /// A second connection used only to hold a brief write lock around a
+    /// checkpoint, so no application write can commit frames the checkpoint
+    /// would move before they've been replicated.
+    writer: Connection,
     path: PathBuf,
     wal_path: PathBuf,
     page_size: u32,
     read_lock_held: bool,
+    write_lock_held: bool,
 }
 
 impl Db {
@@ -119,16 +124,45 @@ impl Db {
              INSERT OR IGNORE INTO {SEQ_TABLE} (id, seq) VALUES (1, 0);"
         ))?;
 
+        // A second connection for the checkpoint write lock (the WAL is already
+        // enabled on the file, so this connection inherits it).
+        let writer = Connection::open(&path)?;
+        writer.busy_timeout(busy_timeout)?;
+
         let mut wal_path = path.clone().into_os_string();
         wal_path.push("-wal");
 
         Ok(Db {
             conn,
+            writer,
             path,
             wal_path: PathBuf::from(wal_path),
             page_size,
             read_lock_held: false,
+            write_lock_held: false,
         })
+    }
+
+    /// Takes SQLite's write lock via a second connection (`BEGIN IMMEDIATE`),
+    /// blocking application writers until [`Db::release_write_lock`]. Used to
+    /// freeze the WAL around a checkpoint. Idempotent.
+    pub fn acquire_write_lock(&mut self) -> Result<(), DbError> {
+        if self.write_lock_held {
+            return Ok(());
+        }
+        self.writer.execute_batch("BEGIN IMMEDIATE")?;
+        self.write_lock_held = true;
+        Ok(())
+    }
+
+    /// Releases the checkpoint write lock. Idempotent.
+    pub fn release_write_lock(&mut self) -> Result<(), DbError> {
+        if !self.write_lock_held {
+            return Ok(());
+        }
+        self.writer.execute_batch("ROLLBACK")?;
+        self.write_lock_held = false;
+        Ok(())
     }
 
     /// The database file path.
