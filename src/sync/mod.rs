@@ -111,10 +111,21 @@ pub struct Syncer {
     pos: Position,
     /// Held for the syncer's lifetime to enforce a single host-local writer.
     _lock: ProcessLock,
-    /// PASSIVE checkpoint when the WAL reaches this many frames.
+    /// PASSIVE checkpoint when the WAL grows this many frames past the last
+    /// checkpoint.
     pub min_checkpoint_frames: u64,
     /// TRUNCATE checkpoint at this many frames (0 disables).
     pub truncate_frames: u64,
+    /// WAL frame count (file high-water) right after the last checkpoint. PASSIVE
+    /// checkpoints don't truncate the `-wal` file, so `wal_frame_count()` reflects
+    /// the high-water, not live frames; we gate the next PASSIVE on growth beyond
+    /// this baseline to avoid checkpointing (and re-snapshotting) every tick.
+    checkpoint_baseline_frames: u64,
+    /// Set when a checkpoint moved more frames into the DB than we had synced —
+    /// i.e. it checkpointed frames we hadn't replicated yet, which now live only
+    /// in the DB file. The next sync must re-snapshot (not incremental) to
+    /// recover them. Cleared once that snapshot succeeds.
+    pending_resync: bool,
 }
 
 impl Syncer {
@@ -125,6 +136,12 @@ impl Syncer {
     pub async fn open(db: Db, client: ReplicaClient) -> Result<Syncer, SyncError> {
         let lock = ProcessLock::acquire(db.path())?;
         let pos = derive_position(&client).await?;
+        let mut db = db;
+        // Pin the WAL read-mark for the syncer's lifetime so an external
+        // connection's checkpoint (e.g. on close) can't reset the WAL and
+        // recycle frames we haven't replicated yet. Our own checkpoints
+        // release and re-acquire it (see `Db::checkpoint`).
+        db.acquire_read_lock()?;
         Ok(Syncer {
             db,
             client,
@@ -132,6 +149,8 @@ impl Syncer {
             _lock: lock,
             min_checkpoint_frames: DEFAULT_MIN_CHECKPOINT_FRAMES,
             truncate_frames: DEFAULT_TRUNCATE_FRAMES,
+            checkpoint_baseline_frames: 0,
+            pending_resync: false,
         })
     }
 
@@ -157,12 +176,13 @@ impl Syncer {
         self.pos.txid
     }
 
-    /// Performs one sync cycle: build the LTX under a pinned read lock, then
-    /// upload it and advance the position.
+    /// Performs one sync cycle: build the LTX under the pinned read lock, then
+    /// upload it and advance the position. The read-mark is held continuously
+    /// across syncs (acquired at [`Syncer::open`]); this call re-acquires it
+    /// only if a checkpoint released it, and deliberately does not release it.
     pub async fn sync(&mut self) -> Result<SyncOutcome, SyncError> {
         self.db.acquire_read_lock()?;
         let built = self.build_under_lock();
-        let _ = self.db.release_read_lock();
 
         let Some(b) = built? else {
             return Ok(SyncOutcome::Skipped);
@@ -177,6 +197,12 @@ impl Syncer {
         {
             PutOutcome::Created | PutOutcome::AlreadyIdentical => {}
             PutOutcome::Conflict => return Err(SyncError::Equivocation { txid: b.max_txid }),
+        }
+
+        // A snapshot re-reads the whole DB, so it recovers any frames a prior
+        // checkpoint moved out of the WAL — the resync is satisfied.
+        if matches!(b.outcome, SyncOutcome::Snapshot { .. }) {
+            self.pending_resync = false;
         }
 
         self.pos = b.new_pos;
@@ -220,16 +246,23 @@ impl Syncer {
         let wal_size = wal.len() as u64;
         let salt_match = (header.salt1, header.salt2) == (self.pos.salt1, self.pos.salt2);
 
+        // A new WAL generation (salt change) or a shrunk WAL means a checkpoint
+        // restarted the log. If that checkpoint moved frames we hadn't synced yet
+        // ([`Self::pending_resync`]), those frames now live only in the DB file, so
+        // we must re-snapshot from the DB to capture them — an incremental would
+        // see only the new generation and silently drop them, corrupting the
+        // restore. Otherwise (the common case: we'd fully drained before the
+        // checkpoint) a cheap incremental from the new generation is correct.
         if self.pos.wal_offset > wal_size || !salt_match {
-            return Ok(if self.pos.synced_to_wal_end {
+            return Ok(if self.pending_resync {
+                Plan::Snapshot {
+                    offset: WAL_HEADER_SIZE as u64,
+                }
+            } else {
                 Plan::Incremental {
                     offset: WAL_HEADER_SIZE as u64,
                     salt1: header.salt1,
                     salt2: header.salt2,
-                }
-            } else {
-                Plan::Snapshot {
-                    offset: WAL_HEADER_SIZE as u64,
                 }
             });
         }
@@ -367,20 +400,46 @@ impl Syncer {
         }))
     }
 
-    /// Applies the 3-tier checkpoint strategy based on WAL frame count. Sync
-    /// before calling this so the frames being checkpointed are already stored.
+    /// Applies the checkpoint strategy based on WAL growth. Sync before calling
+    /// this so the frames being checkpointed are already stored.
+    ///
+    /// PASSIVE fires only once the WAL has grown `min_checkpoint_frames` past the
+    /// previous checkpoint (not on absolute size): a PASSIVE checkpoint reuses the
+    /// `-wal` file in place without shrinking it, so gating on absolute size would
+    /// re-checkpoint every tick — and each checkpoint restarts the WAL (new salt),
+    /// forcing a full re-snapshot. TRUNCATE remains an absolute emergency brake.
     pub fn checkpoint_if_needed(
         &mut self,
     ) -> Result<Option<(CheckpointMode, CheckpointResult)>, SyncError> {
         let frames = self.db.wal_frame_count();
+        let grown = frames.saturating_sub(self.checkpoint_baseline_frames);
         let mode = if self.truncate_frames > 0 && frames >= self.truncate_frames {
             CheckpointMode::Truncate
-        } else if frames >= self.min_checkpoint_frames {
+        } else if grown >= self.min_checkpoint_frames {
             CheckpointMode::Passive
         } else {
             return Ok(None);
         };
-        Ok(Some((mode, self.db.checkpoint(mode)?)))
+        // Frames we've replicated so far in the current WAL generation. If the
+        // checkpoint moves more than this into the DB, it captured frames we
+        // hadn't synced (a non-blocking PASSIVE racing the writer) — flag the next
+        // sync to re-snapshot from the DB. Drain (flush) before calling this so
+        // the common, caught-up case is detected as no-gap.
+        let frame_size = WAL_FRAME_HEADER_SIZE as u64 + self.db.page_size() as u64;
+        let synced_frames = self
+            .pos
+            .wal_offset
+            .saturating_sub(WAL_HEADER_SIZE as u64)
+            / frame_size;
+
+        let result = self.db.checkpoint(mode)?;
+        if result.checkpointed_frames as u64 > synced_frames {
+            self.pending_resync = true;
+        }
+        // Rebaseline to the post-checkpoint high-water so the next PASSIVE waits
+        // for genuine new growth.
+        self.checkpoint_baseline_frames = self.db.wal_frame_count();
+        Ok(Some((mode, result)))
     }
 
     /// Compacts the L0 chain into a single L1 base, pruning the merged files —

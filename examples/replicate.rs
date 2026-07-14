@@ -73,9 +73,9 @@ async fn main() -> ExitCode {
         );
     }
 
-    println!("replica files under {}:", root.join("ltx").display());
-    for level in [1u32, 0u32] {
-        let dir = root.join(format!("ltx/{level}"));
+    println!("replica files under {}:", root.display());
+    for level in [0u32, 9u32] {
+        let dir = root.join(format!("{level:04x}"));
         let Ok(rd) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -84,7 +84,7 @@ async fn main() -> ExitCode {
             .collect();
         files.sort();
         for f in files {
-            println!("  ltx/{level}/{f}");
+            println!("  {level:04x}/{f}");
         }
     }
     ExitCode::SUCCESS

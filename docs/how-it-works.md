@@ -96,7 +96,8 @@ once written, they're never modified.
 ## Step 5: Write to the object store atomically
 
 The LTX bytes are uploaded to the object store under a predictable key like
-`app/ltx/0/<txid-range>.ltx`. Two safety rules apply:
+`app/0000/<txid-range>.ltx` (the level as a 4-digit hex directory, matching
+litestream's remote layout). Two safety rules apply:
 
 - **One writer.** literstream takes a host-local lock on the database file, so
   two processes can't try to replicate the same database at once.

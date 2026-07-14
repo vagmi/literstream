@@ -2,7 +2,8 @@
 //!
 //! It is a thin async wrapper over an [`object_store::ObjectStore`], which
 //! already abstracts local disk, in-memory, S3/Garage, GCS, and Azure behind one
-//! trait. We only add the LTX key layout (`<prefix>/ltx/<level>/<min>-<max>.ltx`)
+//! trait. We only add the LTX key layout (`<prefix>/<level:04x>/<min>-<max>.ltx`,
+//! matching litestream's remote object-store format)
 //! and put/get/list/delete over it. Keys are zero-padded hex so the object
 //! store's lexicographic listing is also TXID order.
 
@@ -61,11 +62,14 @@ impl ReplicaClient {
         }
     }
 
+    /// The key prefix for a level's LTX objects. Matches litestream's remote
+    /// object-store layout `<prefix>/<level:04x>/` (4-digit zero-padded hex
+    /// level, no `ltx/` segment) — see `s3/replica_client.go` (`%04x/`).
     fn level_dir(&self, level: u32) -> String {
         if self.prefix.is_empty() {
-            format!("ltx/{level}")
+            format!("{level:04x}")
         } else {
-            format!("{}/ltx/{level}", self.prefix)
+            format!("{}/{level:04x}", self.prefix)
         }
     }
 

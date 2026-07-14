@@ -137,14 +137,18 @@ async fn snapshot_then_incrementals_restore_to_live_state() {
     assert_eq!(count, 200);
 
     // And it must byte-match the live database once checkpointed into its file.
+    // Drop the syncer first: it holds the pinned read-mark, which (correctly)
+    // blocks an external TRUNCATE checkpoint until released.
     drop(w);
+    drop(syncer);
     {
         let c = Connection::open(&tc.db_path).unwrap();
-        let _: (i64, i64, i64) = c
+        let (busy, _, _): (i64, i64, i64) = c
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?))
             })
             .unwrap();
+        assert_eq!(busy, 0, "checkpoint should complete once the syncer is gone");
     }
     let live = std::fs::read(&tc.db_path).unwrap();
     assert_eq!(
@@ -177,12 +181,14 @@ async fn survives_truncate_checkpoint_and_new_generation() {
     assert!(matches!(ckpt, Some((CheckpointMode::Truncate, _))));
     assert_eq!(syncer.db().wal_size(), 0);
 
-    // New writes land in a fresh WAL generation (new salts).
+    // New writes land in a fresh WAL generation (new salts). A TRUNCATE blocks
+    // writers, so no frames were checkpointed behind our back: the syncer takes
+    // the cheap incremental-after-reset path, not a full re-snapshot.
     insert_range(&w, 201, 301, "second");
     let outcome = syncer.sync().await.unwrap();
     assert!(
         matches!(outcome, SyncOutcome::Incremental { .. }),
-        "expected incremental after checkpoint, got {outcome:?}"
+        "expected incremental after truncate reset, got {outcome:?}"
     );
 
     let image = restore(&client).await.unwrap();
