@@ -121,6 +121,10 @@ pub struct Syncer {
     /// the high-water, not live frames; we gate the next PASSIVE on growth beyond
     /// this baseline to avoid checkpointing (and re-snapshotting) every tick.
     checkpoint_baseline_frames: u64,
+    /// Set when a checkpoint folded frames into the DB that we hadn't replicated
+    /// yet (they now live only in the DB file). The next sync re-snapshots from
+    /// the DB to recover them; cleared once that snapshot succeeds.
+    pending_resync: bool,
 }
 
 impl Syncer {
@@ -144,6 +148,7 @@ impl Syncer {
             _lock: lock,
             min_checkpoint_frames: DEFAULT_MIN_CHECKPOINT_FRAMES,
             checkpoint_baseline_frames: 0,
+            pending_resync: false,
         })
     }
 
@@ -174,13 +179,23 @@ impl Syncer {
     /// across syncs (acquired at [`Syncer::open`]); this call re-acquires it
     /// only if a checkpoint released it, and deliberately does not release it.
     pub async fn sync(&mut self) -> Result<SyncOutcome, SyncError> {
+        match self.build_next()? {
+            None => Ok(SyncOutcome::Skipped),
+            Some(built) => self.commit_built(built).await,
+        }
+    }
+
+    /// Reads the WAL/DB and builds the next LTX file in memory — no network I/O.
+    /// Splitting build from upload lets [`Syncer::checkpoint_if_needed`] hold the
+    /// built frames across a checkpoint (an in-memory shadow), so a WAL reset
+    /// can't lose them.
+    fn build_next(&mut self) -> Result<Option<BuiltFile>, SyncError> {
         self.db.acquire_read_lock()?;
-        let built = self.build_under_lock();
+        self.build_under_lock()
+    }
 
-        let Some(b) = built? else {
-            return Ok(SyncOutcome::Skipped);
-        };
-
+    /// Uploads an already-built LTX file and advances the replication position.
+    async fn commit_built(&mut self, b: BuiltFile) -> Result<SyncOutcome, SyncError> {
         // Guard against split-brain: never overwrite a different LTX already at
         // this TXID. Identical bytes = an idempotent retry of our own upload.
         match self
@@ -190,6 +205,12 @@ impl Syncer {
         {
             PutOutcome::Created | PutOutcome::AlreadyIdentical => {}
             PutOutcome::Conflict => return Err(SyncError::Equivocation { txid: b.max_txid }),
+        }
+
+        // A snapshot re-reads the whole DB, recovering any frames a checkpoint
+        // moved out of the WAL — the pending resync is satisfied.
+        if matches!(b.outcome, SyncOutcome::Snapshot { .. }) {
+            self.pending_resync = false;
         }
 
         self.pos = b.new_pos;
@@ -254,15 +275,22 @@ impl Syncer {
         let salt_match = (header.salt1, header.salt2) == (self.pos.salt1, self.pos.salt2);
 
         // A new WAL generation (salt change) or a shrunk WAL means a checkpoint
-        // restarted the log. Because checkpoints run under a write lock after a
-        // final sync (see `checkpoint_if_needed`), every frame from the old
-        // generation is already in the LTX chain, so we can safely continue with
-        // a cheap incremental from the start of the new generation.
+        // restarted the log. If that checkpoint folded un-replicated frames into
+        // the DB ([`Self::pending_resync`]), re-snapshot from the DB to recover
+        // them — an incremental would only see the new generation and drop them.
+        // Otherwise the old generation is fully in the LTX chain, so continue
+        // with a cheap incremental from the start of the new generation.
         if self.pos.wal_offset > wal_len || !salt_match {
-            return Plan::Incremental {
-                offset: WAL_HEADER_SIZE as u64,
-                salt1: header.salt1,
-                salt2: header.salt2,
+            return if self.pending_resync {
+                Plan::Snapshot {
+                    offset: WAL_HEADER_SIZE as u64,
+                }
+            } else {
+                Plan::Incremental {
+                    offset: WAL_HEADER_SIZE as u64,
+                    salt1: header.salt1,
+                    salt2: header.salt2,
+                }
             };
         }
 
@@ -424,17 +452,18 @@ impl Syncer {
         }))
     }
 
-    /// Checkpoints the WAL when it has grown enough, under a brief write lock so
-    /// the checkpoint can't move frames we haven't replicated yet.
+    /// Checkpoints the WAL when it has grown enough — **without blocking the
+    /// application** (litestream's philosophy).
     ///
-    /// The write lock (a second connection's `BEGIN IMMEDIATE`) freezes
-    /// application writes; a final sync then uploads every committed frame, so
-    /// once the checkpoint runs, everything it folds into the DB is already in
-    /// the LTX chain (the durable "shadow"). A WAL reset therefore needs no
-    /// re-snapshot — the next sync continues incrementally. PASSIVE fires on WAL
-    /// *growth* past the previous checkpoint (a PASSIVE checkpoint reuses the
-    /// `-wal` in place without shrinking it, so absolute size would re-checkpoint
-    /// every tick); TRUNCATE is an absolute emergency brake.
+    /// It *builds* the pending LTX from the WAL tail (fast, local), checkpoints
+    /// immediately (non-blocking PASSIVE; [`Db::checkpoint`] then seq-bumps to
+    /// restart the WAL and keep it bounded), and only *then* uploads. Holding the
+    /// built frames across the checkpoint — an in-memory shadow — means a WAL
+    /// reset can't lose them, so the race window shrinks from an upload round-trip
+    /// to a local build. If the checkpoint still folds a frame into the DB that we
+    /// hadn't captured (a write landing in that tiny window), we *detect* it and
+    /// re-snapshot on the next sync. Correctness by noticing, never by stalling a
+    /// write.
     pub async fn checkpoint_if_needed(
         &mut self,
     ) -> Result<Option<(CheckpointMode, CheckpointResult)>, SyncError> {
@@ -442,27 +471,42 @@ impl Syncer {
         if frames.saturating_sub(self.checkpoint_baseline_frames) < self.min_checkpoint_frames {
             return Ok(None);
         }
-        // Always PASSIVE: run under our write lock (below) with no concurrent
-        // writers and our read-mark released, a PASSIVE checkpoint fully drains
-        // and restarts the WAL — so we never need TRUNCATE (which would deadlock
-        // against the write lock we hold).
         let mode = CheckpointMode::Passive;
 
-        // Freeze writers, drain the last committed frames, then checkpoint. The
-        // write lock guarantees nothing new commits in between, so the checkpoint
-        // never moves an un-replicated frame.
-        self.db.acquire_write_lock()?;
-        let synced = self.sync().await;
-        let checkpointed = match synced {
-            Ok(_) => self.db.checkpoint(mode).map_err(SyncError::from),
-            Err(e) => Err(e),
-        };
-        let _ = self.db.release_write_lock();
-        let result = checkpointed?;
+        // 1. Build (don't upload) the frames committed up to now. This is the
+        //    in-memory shadow: it survives the WAL reset below.
+        let built = self.build_next()?;
+        let frame_size = WAL_FRAME_HEADER_SIZE as u64 + self.db.page_size() as u64;
+        let captured_offset = built
+            .as_ref()
+            .map(|b| b.new_pos.wal_offset)
+            .unwrap_or(self.pos.wal_offset);
+        let synced_frames = captured_offset.saturating_sub(WAL_HEADER_SIZE as u64) / frame_size;
 
-        // Rebaseline to the post-checkpoint high-water so the next PASSIVE waits
-        // for genuine new growth.
-        self.checkpoint_baseline_frames = self.db.wal_frame_count();
+        // 2. Checkpoint immediately — only a local build separates it from the
+        //    capture above.
+        let result = self.db.checkpoint(mode)?;
+
+        // 3. Upload the captured frames (they outlived the reset because we held
+        //    them). A failure here leaves them in the DB but not the chain, so
+        //    flag a resync to recover from the DB next time.
+        if let Some(b) = built {
+            if let Err(e) = self.commit_built(b).await {
+                self.pending_resync = true;
+                return Err(e);
+            }
+        }
+
+        // 4. Detect a frame that slipped into the DB during the build→checkpoint
+        //    window (rare): the checkpoint moved more than we captured.
+        if result.checkpointed_frames as u64 > synced_frames {
+            self.pending_resync = true;
+        }
+        // Rebaseline only when the checkpoint made progress, so a skipped (busy)
+        // checkpoint is retried on the next tick.
+        if !result.busy {
+            self.checkpoint_baseline_frames = self.db.wal_frame_count();
+        }
         Ok(Some((mode, result)))
     }
 

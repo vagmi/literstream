@@ -74,15 +74,10 @@ impl CheckpointResult {
 /// A literstream-managed handle to a SQLite database.
 pub struct Db {
     conn: Connection,
-    /// A second connection used only to hold a brief write lock around a
-    /// checkpoint, so no application write can commit frames the checkpoint
-    /// would move before they've been replicated.
-    writer: Connection,
     path: PathBuf,
     wal_path: PathBuf,
     page_size: u32,
     read_lock_held: bool,
-    write_lock_held: bool,
 }
 
 impl Db {
@@ -124,44 +119,27 @@ impl Db {
              INSERT OR IGNORE INTO {SEQ_TABLE} (id, seq) VALUES (1, 0);"
         ))?;
 
-        // A second connection for the checkpoint write lock (the WAL is already
-        // enabled on the file, so this connection inherits it).
-        let writer = Connection::open(&path)?;
-        writer.busy_timeout(busy_timeout)?;
-
         let mut wal_path = path.clone().into_os_string();
         wal_path.push("-wal");
 
         Ok(Db {
             conn,
-            writer,
             path,
             wal_path: PathBuf::from(wal_path),
             page_size,
             read_lock_held: false,
-            write_lock_held: false,
         })
     }
 
-    /// Takes SQLite's write lock via a second connection (`BEGIN IMMEDIATE`),
-    /// blocking application writers until [`Db::release_write_lock`]. Used to
-    /// freeze the WAL around a checkpoint. Idempotent.
-    pub fn acquire_write_lock(&mut self) -> Result<(), DbError> {
-        if self.write_lock_held {
-            return Ok(());
-        }
-        self.writer.execute_batch("BEGIN IMMEDIATE")?;
-        self.write_lock_held = true;
-        Ok(())
-    }
-
-    /// Releases the checkpoint write lock. Idempotent.
-    pub fn release_write_lock(&mut self) -> Result<(), DbError> {
-        if !self.write_lock_held {
-            return Ok(());
-        }
-        self.writer.execute_batch("ROLLBACK")?;
-        self.write_lock_held = false;
+    /// Bumps the `_literstream_seq` row — one WAL write. Used right after a
+    /// PASSIVE checkpoint (with the read-mark released) to force a fully
+    /// backfilled WAL to restart into a fresh generation now, and to seed a real
+    /// frame for the next read-mark to pin. Mirrors litestream's approach.
+    fn bump_seq(&self) -> Result<(), DbError> {
+        self.conn.execute_batch(&format!(
+            "INSERT INTO {SEQ_TABLE} (id, seq) VALUES (1, 1)
+             ON CONFLICT(id) DO UPDATE SET seq = seq + 1"
+        ))?;
         Ok(())
     }
 
@@ -231,6 +209,11 @@ impl Db {
 
     /// Runs `PRAGMA wal_checkpoint(mode)`, releasing and re-acquiring the read
     /// lock around it (our own read-mark must not block our own checkpoint).
+    ///
+    /// For a non-blocking PASSIVE checkpoint that fully backfilled the WAL, it
+    /// then bumps `_literstream_seq` — while the read-mark is still released — so
+    /// the WAL restarts into a fresh generation immediately (bounding it on disk)
+    /// instead of growing until some future write triggers the restart.
     pub fn checkpoint(&mut self, mode: CheckpointMode) -> Result<CheckpointResult, DbError> {
         let had_lock = self.read_lock_held;
         if had_lock {
@@ -248,6 +231,13 @@ impl Db {
                 })
             },
         )?;
+
+        // Force the restart of a fully-checkpointed WAL (PASSIVE doesn't reset the
+        // WAL itself; a later write does — so trigger it now, while nothing holds
+        // a read-mark to block it).
+        if mode == CheckpointMode::Passive && !result.busy {
+            self.bump_seq()?;
+        }
 
         if had_lock {
             self.acquire_read_lock()?;

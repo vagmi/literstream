@@ -43,43 +43,50 @@ After the fixes below. Both tools restore to the exact source row count with
 
 | Metric | literstream (Rust) | litestream (Go) |
 |---|---|---|
-| **light** (~300 rows/s) — avg RSS | **15.5 MB** | 37.8 MB |
-| light — peak RSS | **26 MB** | 40 MB |
-| light — CPU | **0.12 s** | 0.23 s |
-| **heavy** (~2000 rows/s) — avg RSS | **39.0 MB** | 39.3 MB |
-| heavy — peak RSS | 65 MB | **41 MB** |
-| heavy — CPU | **0.32 s** | 0.63 s |
+| **light** (~300 rows/s) — avg RSS | **16 MB** | 38 MB |
+| light — peak RSS | **28 MB** | 41 MB |
+| light — CPU | **0.12 s** | 0.26 s |
+| **heavy** (~2000 rows/s) — avg RSS | **40.6 MB** | 38.6 MB |
+| heavy — peak RSS | 63 MB | **42 MB** |
+| heavy — CPU | **0.34 s** | 0.57 s |
 | binary size | **9.5 MB** | 51 MB |
 
 **Rust wins CPU everywhere (~2×) and memory on light/small databases; on the heavy
-large-DB case it now ties Go on average RSS (39 vs 39).** The only remaining gap is
-heavy *peak* RSS (65 vs 41), a transient spike during the final shutdown flush.
+large-DB case it ties Go on average RSS (40.6 vs 38.6).** The only remaining gap is
+heavy *peak* RSS (63 vs 42), an occasional re-snapshot spike. Both restore exactly
+with a clean integrity check.
 
 For context, before the perf work the heavy case was **909 MB peak / 3.5 s CPU**;
-it is now 65 MB / 0.32 s and correct — a ~14× memory and ~11× CPU improvement.
+it is now 63 MB / 0.34 s and correct — a ~14× memory and ~10× CPU improvement.
 
-## How the memory got flat
+## The checkpoint model (matches Litestream's philosophy)
 
-Three coupled changes brought Rust's RSS from climbing-with-DB-size to flat:
+Like Litestream, literstream **never stalls the application writer**. The
+checkpoint is non-blocking PASSIVE; correctness against the checkpoint/replication
+race comes from *noticing*, not from freezing writes:
 
-1. **Checkpoint under a write lock** (`Db::acquire_write_lock`, a second
-   connection's `BEGIN IMMEDIATE`). Freezing writes around a final sync +
-   checkpoint means the checkpoint never folds an un-replicated frame into the
-   DB, so a WAL reset needs *no* re-snapshot (the earlier fix re-snapshotted the
-   whole DB on every racing checkpoint — the memory climb). PASSIVE-under-lock
-   also makes TRUNCATE unnecessary.
-2. **Bounded WAL tail reads.** Each incremental sync reads only `[offset..EOF]`
-   of the `-wal` (the new frames), not the whole file — `WalReader::from_tail`
-   parses a partial buffer with a base offset. Per-sync memory is now O(new
-   frames) regardless of WAL size.
-3. **Single-threaded runtime** for the CLI (`current_thread`) — the replicator is
-   one I/O-bound task.
+1. **Capture first, upload later (an in-memory shadow).** `checkpoint_if_needed`
+   *builds* the pending LTX from the WAL (fast, local) and holds it, then
+   checkpoints, then uploads. Because the captured bytes outlive the WAL reset, the
+   race window shrinks from a network upload to a local build — so re-snapshots
+   become *rare*, not one per checkpoint. This dropped heavy avg RSS from ~49 MB to
+   ~40 MB.
+2. **Detection.** If the checkpoint still folds more frames into the DB than we
+   captured (a write in that tiny window), the next sync **re-snapshots** from the
+   DB. Correctness by noticing — never a write stall. These rare re-snapshots
+   (whole-DB reads) are the source of the heavy-case peak.
+3. **Seq-bump reset.** After a PASSIVE checkpoint that fully drained the WAL,
+   literstream writes one `_literstream_seq` row (while the read-mark is released)
+   to force SQLite to restart the WAL into a fresh generation — the same trick
+   Litestream uses to keep the WAL bounded.
+4. **Bounded WAL tail reads** (`WalReader::from_tail`, O(new frames)) and a
+   **single-threaded runtime** for the CLI (`current_thread`).
 
-**Known limitation:** under *pathological continuous* writes the WAL can grow on
-disk (our long-lived read-mark blocks SQLite's WAL restart), because a true
-non-blocking shadow WAL isn't implemented. Memory stays flat regardless (tail
-reads), and real/bursty workloads reset the WAL during idle windows. A full
-shadow WAL (litestream's design) would bound the WAL on disk under all loads.
+**Known limitation (shared with Litestream):** the shadow is *in-memory* (covers a
+single checkpoint, not a process restart), and under *sustained* writes PASSIVE
+keeps returning `SQLITE_BUSY` and can't fully drain, so the seq-bump reset only
+fires in idle windows and the `-wal` can grow on disk (monitor it). A *persistent*
+shadow WAL would also survive restarts — a further step this port doesn't take.
 
 ## Bugs found and fixed via this bench
 
@@ -91,17 +98,14 @@ shadow WAL (litestream's design) would bound the WAL on disk under all loads.
 
 2. **Re-snapshot storm → huge memory/CPU.** `wal_frame_count()` reads the `-wal`
    file's high-water size, which a PASSIVE checkpoint doesn't shrink — so the
-   checkpoint threshold tripped *every tick*, each checkpoint restarted the WAL
-   (new salt), and the salt change forced a full re-snapshot (the 909 MB spike).
-   Fixed by gating PASSIVE on WAL **growth since the last checkpoint**.
+   checkpoint threshold tripped *every tick*, forcing a full re-snapshot each time
+   (the 909 MB spike). Fixed by gating on WAL **growth since the last checkpoint**.
 
-3. **Checkpoint gap → corrupt restore.** Fixing (2) exposed a latent gap: a
-   non-blocking PASSIVE checkpoint can move frames into the DB that we hadn't
-   synced, and the following incremental (new WAL generation) silently dropped
-   them → malformed image. Fixed by checkpointing **under a write lock** (a second
-   connection's `BEGIN IMMEDIATE`) around a final sync, so no frame commits between
-   our last upload and the checkpoint — the incremental-after-reset path is then
-   always safe, and no re-snapshot is needed.
+3. **Checkpoint gap → corrupt restore.** A non-blocking PASSIVE checkpoint can
+   fold frames into the DB that we hadn't synced; the following incremental
+   silently dropped them → malformed image. Fixed by **detecting** it (checkpoint
+   moved more frames than we'd synced → next sync re-snapshots) — Litestream's
+   never-block approach, not a write freeze.
 
 4. **Replica key layout.** Aligned to litestream's `<prefix>/<level:04x>/…` remote
    layout so the port can restore litestream's S3/GCS replicas (verified) and vice

@@ -11,7 +11,7 @@ slowing it down and without ever copying a half-written state. Here's how.
 
 ## The problem: backing up a moving target
 
-You can't just `cp app.db backup.db` on a database that's being written — you'd
+You can't just `cp app.db backup.db` on a database that's being written; you'd
 capture a torn, inconsistent snapshot. And copying the whole file every time
 anything changes is hugely wasteful. We want to copy only *what changed*, and
 only *complete* transactions.
@@ -30,15 +30,15 @@ Two things make this perfect for replication:
 1. **The WAL is append-only.** New changes go on the end, so we can read it
    forward like a log and never miss anything.
 2. **It's a precise change-list.** Each WAL frame says "page N now looks like
-   this." That's exactly the delta we want to ship — not the whole database.
+   this." That's exactly the delta we want to ship, not the whole database.
 
-Later, SQLite folds the WAL back into the main file in an operation called a
+Later, SQLite merges the WAL back into the main file in an operation called a
 **checkpoint**. That's where the danger is (see Steps 3 and 6).
 
 ## Step 2: Take control of checkpointing
 
 Normally SQLite checkpoints automatically whenever the WAL gets big. But a
-checkpoint **resets the WAL**: once frames are folded into the main file, SQLite
+checkpoint **resets the WAL**: once frames are merged into the main file, SQLite
 is free to overwrite them with new writes. If that happens *before* literstream
 has copied those frames out, they're gone resulting in a hole in our backup.
 
@@ -114,22 +114,44 @@ upload is simply retried from the same spot.
 ## Step 6: Checkpoint without leaving a gap
 
 Once the new frames are safely in the object store, literstream **checkpoints**
-the WAL merging them into the main database file so the WAL doesn't grow
-forever.
+the WAL, merging them into the main database file.
 
-Here's the subtle part. A normal checkpoint is *non-blocking*: it runs alongside
-your application's writes. That opens a tiny race. The checkpoint can fold a
-frame that was *just* committed into the main file before literstream has
-replicated it. Once the WAL then resets to make room, that frame lives only in
-the main DB file, invisible to the next incremental read. A silent hole in the
-backup. (This is a genuine bug we hit and fixed.)
+Here's the subtle part. A non-blocking (PASSIVE) checkpoint runs alongside your
+writes, so it can merge a *just-committed* frame into the main file before
+literstream has replicated it. Once the WAL resets, that frame lives only in the
+DB file, invisible to the next incremental read. A silent hole. (A real bug we
+hit.)
 
-literstream closes the race by briefly **freezing writes** around the checkpoint.
-It grabs SQLite's write lock through a *second* connection, does one final sync to
-capture every committed frame, and only then checkpoints. Because nothing can be
-written in between, everything the checkpoint folds away is already in the LTX
-chain. The freeze lasts just the checkpoint itself and only happens once the WAL
-has grown past a threshold, so your writers barely notice.
+literstream follows Litestream's rule here: **never stall the writer on the happy
+path.** So instead of *excluding* the race, it *notices* it. Around a checkpoint
+it does three things:
+
+1. **Capture first, upload later (a shadow).** It builds the pending LTX from the
+   WAL (a fast, local step) *before* checkpointing, and holds those bytes in
+   memory. Then it checkpoints, then it uploads. Because the captured frames
+   outlive the WAL reset (we're holding them), the checkpoint can't lose them, and
+   the only window where a frame could slip past unrecorded shrinks from a network
+   upload down to a local build.
+2. **Restart the WAL (seq-bump).** Right after a PASSIVE checkpoint that drained
+   the WAL, while no read-mark is held to block it, it writes one row to
+   `_literstream_seq`, forcing SQLite to *restart* the WAL into a fresh generation
+   (reusing the file instead of extending it) and seeding a real frame for the next
+   read-mark to pin.
+3. **Detect the rest.** It still compares what the checkpoint merged into the DB
+   against what it captured; if a write did land in that tiny window, the next sync
+   **re-snapshots** from the DB to recover it. Correctness by noticing, never a
+   stall.
+
+The capture-first step makes those re-snapshots *rare* (only a write in the
+build-sized window), not one per checkpoint.
+
+> **Trade-off, stated honestly.** This is Litestream's cost profile: the app is
+> never blocked, and the price is a rare re-snapshot when a checkpoint outruns
+> replication. The shadow here is *in-memory* (it covers a single checkpoint, not
+> a process restart); under *sustained* writes PASSIVE keeps returning busy and the
+> WAL can still grow on disk (Litestream has the same property, so monitor disk),
+> resetting in idle windows. A *persistent* shadow WAL would also survive restarts,
+> a further step this port doesn't take.
 
 ## Step 7: Compaction
 
@@ -137,11 +159,11 @@ If we only ever wrote one small file per transaction, restoring would eventually
 mean replaying millions of tiny files. So literstream **compacts**, exactly like
 Litestream, using tiered, time-based **levels**:
 
-- **Level 0** is the raw stream — one file per sync.
+- **Level 0** is the raw stream, one file per sync.
 - **Higher levels** merge the level below them on a schedule (by default: L0→L1
   every 30s, L1→L2 every 5m, L2→L3 every 1h). Merging keeps only the latest
   version of each page, so files get fewer and larger as they age.
-- **Level 9** holds periodic **full snapshots** — a complete database image that
+- **Level 9** holds periodic **full snapshots**: a complete database image that
   serves as a restore anchor.
 
 Merging is just combining LTX files into a bigger LTX file, so everything stays
@@ -192,7 +214,7 @@ each tick:  sync → checkpoint (if WAL is big) → compact levels (on their int
             → snapshot (on its interval) → enforce retention
 ```
 
-Give it a wall-clock time and it does the right thing on the right cadence — the
+Give it a wall-clock time and it does the right thing on the right cadence, the
 library equivalent of Litestream's background loop.
 
 ---
