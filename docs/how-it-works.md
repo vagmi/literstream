@@ -33,7 +33,7 @@ Two things make this perfect for replication:
    this." That's exactly the delta we want to ship — not the whole database.
 
 Later, SQLite folds the WAL back into the main file in an operation called a
-**checkpoint**. That's where the danger is (see Step 3).
+**checkpoint**. That's where the danger is (see Steps 3 and 6).
 
 ## Step 2: Take control of checkpointing
 
@@ -84,10 +84,10 @@ Now the copying. Each time literstream syncs:
 3. It packages those pages into an **LTX file**. LTX is a compact, self-describing,
    checksummed container. Each file covers a range of transaction IDs.
 
-The **first** sync writes a full **snapshot** (every page, transaction range
-`1..=N`). Every sync after that writes an **incremental**. Only the pages that
-changed are written. LTX files are named by their transaction range and are **immutable**:
-once written, they're never modified.
+The **first** sync writes a full **snapshot**, every page in the database, as
+one LTX file. Every sync after that writes an **incremental**, only the pages
+that changed. LTX files are named by their transaction range and are
+**immutable**: once written, they're never modified.
 
 > LTX is Litestream's format (from `superfly/ltx`). literstream writes it
 > byte-for-byte the same way, which is why the two tools can restore each other's
@@ -111,11 +111,27 @@ litestream's remote layout). Two safety rules apply:
 Replication position only advances *after* a successful upload, so a failed
 upload is simply retried from the same spot.
 
-Only once frames are safely in the object store does literstream run a
-checkpoint to merge them into the main DB file and keep the WAL from growing
-without bound.
+## Step 6: Checkpoint without leaving a gap
 
-## Step 6: Compaction
+Once the new frames are safely in the object store, literstream **checkpoints**
+the WAL merging them into the main database file so the WAL doesn't grow
+forever.
+
+Here's the subtle part. A normal checkpoint is *non-blocking*: it runs alongside
+your application's writes. That opens a tiny race. The checkpoint can fold a
+frame that was *just* committed into the main file before literstream has
+replicated it. Once the WAL then resets to make room, that frame lives only in
+the main DB file, invisible to the next incremental read. A silent hole in the
+backup. (This is a genuine bug we hit and fixed.)
+
+literstream closes the race by briefly **freezing writes** around the checkpoint.
+It grabs SQLite's write lock through a *second* connection, does one final sync to
+capture every committed frame, and only then checkpoints. Because nothing can be
+written in between, everything the checkpoint folds away is already in the LTX
+chain. The freeze lasts just the checkpoint itself and only happens once the WAL
+has grown past a threshold, so your writers barely notice.
+
+## Step 7: Compaction
 
 If we only ever wrote one small file per transaction, restoring would eventually
 mean replaying millions of tiny files. So literstream **compacts**, exactly like
@@ -131,7 +147,7 @@ Litestream, using tiered, time-based **levels**:
 Merging is just combining LTX files into a bigger LTX file, so everything stays
 byte-compatible.
 
-## Step 7:  Retention
+## Step 8: Retention
 
 Compaction bounds the *number* of files; **retention** bounds their *age*. Old
 files are deleted once they've been safely merged into a higher level and are
@@ -144,7 +160,7 @@ inside the retention window every individual transaction is restorable; once a
 point ages out, restoring to it snaps to the nearest surviving (coarser)
 boundary.
 
-## Step 8: Restoring
+## Step 9: Restoring
 
 Restoring reverses the whole process and needs nothing but the object store:
 
