@@ -158,6 +158,17 @@ checkpoint can touch them, and it notices the one case it cannot prevent.
 Staging the file before the checkpoint closes the crash window, and the catch-up
 snapshots stay rare because they only happen when a write beats the checkpoint.
 
+One more thing about idle databases. That WAL restart is only worth doing when
+the WAL has actually grown from application writes, so it happens only on the
+size-triggered checkpoint, not the time-based one. The reason matters: the
+restart is itself a tiny write, and if the time-based checkpoint did it on a
+schedule, a database that was written once and then went idle would keep shipping
+one small file every minute forever, a steady cost for no real work. With the
+restart gated on real growth, an idle database goes completely quiet: each sync
+finds nothing new, no checkpoint fires, and no files are produced. This is what
+makes holding many mostly-idle databases in one process cheap, as the next
+section explains.
+
 > **Trade-off, stated honestly.** This is Litestream's cost profile. The
 > application is never blocked, and the price is a rare catch-up snapshot when a
 > checkpoint outruns replication, plus one fsync per sync for the staged file.
@@ -181,7 +192,10 @@ Litestream, using tiered, time-based **levels**:
   serves as a restore anchor.
 
 Merging is just combining LTX files into a bigger LTX file, so everything stays
-byte-compatible.
+byte-compatible. It is done as a streaming k-way merge: literstream reads one
+page at a time from each input and writes the merged output straight to a
+temporary file, so compacting even a whole-database snapshot uses only a few
+kilobytes of memory rather than loading the files into RAM.
 
 ## Step 8: Retention
 
@@ -234,6 +248,41 @@ each tick:  sync → checkpoint (when the WAL is big enough or on a time interva
 
 Give it a wall-clock time and it does the right thing on the right cadence, the
 library equivalent of Litestream's background loop.
+
+## Running many databases in one process
+
+Because literstream is a library rather than a daemon, one process can replicate
+hundreds of databases at once: open a `Db` and a `Driver` for each, give each its
+own key prefix in the same bucket, and tick them all on the same interval. This is
+the natural shape for a service that hosts many small per-tenant databases. Three
+things make it cheap.
+
+**Memory scales linearly and gently.** Each database's replicator holds little
+more than its two SQLite connections and a small amount of state, so resident
+memory grows by a fraction of a megabyte per database on a fixed base. A hundred
+databases replicating live sit in tens of megabytes, and it extrapolates cleanly
+to thousands.
+
+**Steady state does not list the object store.** Compaction and retention need to
+know which files exist, and the obvious way to find out is to list the bucket on
+every cycle. For a fleet of mostly-idle databases that fixed polling would
+dominate the object-store bill, and listing is one of the more expensive
+operations. So instead each replicator keeps a local index of the files it has
+written, seeded once when it opens and then kept current on every upload and
+delete. Because a single writer owns each database, that local view stays exactly
+in step with the bucket, and the replicator never has to list again. The only
+recurring object-store operations are the writes themselves and the reads a
+compaction needs, both of which scale with actual write activity, not with how
+many databases are sitting idle.
+
+**Idle databases cost almost nothing.** As described in Step 6, a database that is
+not being written produces no files at all. So the bill tracks the databases that
+are actually busy at any moment, not the size of the fleet.
+
+Two tools make this concrete. `examples/fanout_bench.rs` runs N databases against
+a real or local object store and reports memory, correctness, and a per-operation
+request count. `scripts/ops-estimate.py` turns your intervals and write cadence
+into an estimated monthly operation count and cost.
 
 ---
 

@@ -50,7 +50,7 @@ fn main() {
     }
     println!();
 
-    let r = db.checkpoint(CheckpointMode::Passive).unwrap();
+    let r = db.checkpoint(CheckpointMode::Passive, true).unwrap();
     println!(
         "PASSIVE checkpoint: busy={} log={} checkpointed={} (fully = {})",
         r.busy,
@@ -63,7 +63,7 @@ fn main() {
         db.wal_size()
     );
 
-    let r = db.checkpoint(CheckpointMode::Truncate).unwrap();
+    let r = db.checkpoint(CheckpointMode::Truncate, true).unwrap();
     println!("TRUNCATE checkpoint: busy={}", r.busy);
     println!("  wal now: {} bytes", db.wal_size());
 

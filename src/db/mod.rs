@@ -214,7 +214,11 @@ impl Db {
     /// then bumps `_literstream_seq` — while the read-mark is still released — so
     /// the WAL restarts into a fresh generation immediately (bounding it on disk)
     /// instead of growing until some future write triggers the restart.
-    pub fn checkpoint(&mut self, mode: CheckpointMode) -> Result<CheckpointResult, DbError> {
+    pub fn checkpoint(
+        &mut self,
+        mode: CheckpointMode,
+        restart_wal: bool,
+    ) -> Result<CheckpointResult, DbError> {
         let had_lock = self.read_lock_held;
         if had_lock {
             self.release_read_lock()?;
@@ -233,9 +237,14 @@ impl Db {
         )?;
 
         // Force the restart of a fully-checkpointed WAL (PASSIVE doesn't reset the
-        // WAL itself; a later write does — so trigger it now, while nothing holds
-        // a read-mark to block it).
-        if mode == CheckpointMode::Passive && !result.busy {
+        // WAL itself; a later write does, so trigger it now while nothing holds a
+        // read-mark to block it). Only do this when `restart_wal` is set: the
+        // frame-threshold checkpoint asks for it (the WAL grew from real writes),
+        // but the *time-based* checkpoint does not, because the seq bump is itself
+        // a WAL write that the next sync would ship as a tiny LTX file and then
+        // re-trigger this checkpoint — a perpetual, write-free cost for a database
+        // that was written once and then went idle.
+        if restart_wal && mode == CheckpointMode::Passive && !result.busy {
             self.bump_seq()?;
         }
 

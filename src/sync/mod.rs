@@ -17,6 +17,7 @@
 //! *frame*-compressed pages — matching litestream (ltx v0.5.1) exactly, so the
 //! real litestream binary restores our replicas and we restore its.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::fs::File;
 use std::io::{BufWriter, Read, Seek, SeekFrom};
@@ -34,7 +35,7 @@ use crate::ltx::{
     Checksum, Decoder, Encoder, HEADER_FLAG_NO_CHECKSUM, HEADER_SIZE, Header, INDEX_FOOTER_SIZE,
     compact_to_writer, decode_page_frame, decode_page_index, lock_pgno, merge_to_writer, read_file,
 };
-use crate::storage::{PutOutcome, ReplicaClient};
+use crate::storage::{LtxFileInfo, PutOutcome, ReplicaClient};
 use crate::wal::{
     PageMap, WAL_FRAME_HEADER_SIZE, WAL_HEADER_SIZE, WalError, WalFrameHeader, WalHeader, WalReader,
 };
@@ -120,6 +121,52 @@ struct StagedFile {
     new_pos: Position,
 }
 
+/// A local, in-memory index of the LTX files this syncer has in the replica,
+/// keyed by level then `(min_txid, max_txid)`. It is seeded once from the store
+/// on [`Syncer::open`], then maintained on every upload and delete, so a
+/// single-writer syncer never has to `list` the store again to plan compaction
+/// or retention. Because this process is the only writer (enforced by the host
+/// lock), the index stays in step with the store: every mutation goes through
+/// here. A failed delete keeps its entry, so it is retried rather than orphaned.
+#[derive(Default)]
+struct FileIndex {
+    levels: BTreeMap<u32, BTreeMap<(u64, u64), LtxFileInfo>>,
+}
+
+impl FileIndex {
+    fn insert(&mut self, info: LtxFileInfo) {
+        self.levels
+            .entry(info.level)
+            .or_default()
+            .insert((info.min_txid, info.max_txid), info);
+    }
+
+    fn remove(&mut self, level: u32, min: u64, max: u64) {
+        if let Some(m) = self.levels.get_mut(&level) {
+            m.remove(&(min, max));
+        }
+    }
+
+    /// Files at `level`, ascending by `(min_txid, max_txid)`.
+    fn list(&self, level: u32) -> Vec<LtxFileInfo> {
+        self.levels
+            .get(&level)
+            .map(|m| m.values().copied().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every file across all levels as `(level, min_txid, max_txid)`.
+    fn all_levels(&self) -> Vec<(u32, u64, u64)> {
+        let mut out = Vec::new();
+        for (level, m) in &self.levels {
+            for info in m.values() {
+                out.push((*level, info.min_txid, info.max_txid));
+            }
+        }
+        out
+    }
+}
+
 /// Replicates a [`Db`]'s WAL to an object-store replica.
 pub struct Syncer {
     db: Db,
@@ -142,6 +189,9 @@ pub struct Syncer {
     /// fsync'd here before the checkpoint that could fold its frames into the DB,
     /// then uploaded and removed. Leftovers are re-uploaded on [`Syncer::open`].
     staging: PathBuf,
+    /// Local mirror of the replica's file set, so steady-state compaction and
+    /// retention plan without listing the store. See [`FileIndex`].
+    files: FileIndex,
 }
 
 impl Syncer {
@@ -157,7 +207,16 @@ impl Syncer {
         // whole-DB re-snapshot — and must run before we derive the position, so
         // the position reflects the now-complete chain.
         recover_staging(&staging, &client).await?;
-        let pos = derive_position(&client).await?;
+        // Seed the local file index from the store. This is the one necessary
+        // list on open (to recover what the replica holds after a restart);
+        // steady-state planning then reads the index, not the store.
+        let mut files = FileIndex::default();
+        for level in 0..=MAX_LEVEL {
+            for f in client.list_ltx(level).await? {
+                files.insert(f);
+            }
+        }
+        let pos = derive_position(&files, &client).await?;
         let mut db = db;
         // Pin the WAL read-mark for the syncer's lifetime so an external
         // connection's checkpoint (e.g. on close) can't reset the WAL and
@@ -173,6 +232,7 @@ impl Syncer {
             truncate_frames: DEFAULT_TRUNCATE_FRAMES,
             resnapshots: 0,
             staging,
+            files,
         })
     }
 
@@ -222,7 +282,15 @@ impl Syncer {
     /// Uploads a staged LTX file, removes it, and advances the replication
     /// position. A failed upload leaves the file staged for a later retry.
     async fn upload_staged(&mut self, s: StagedFile) -> Result<SyncOutcome, SyncError> {
+        let size = fs::metadata(&s.path).map(|m| m.len()).unwrap_or(0);
         upload_ltx_file(&self.client, s.level, s.min_txid, s.max_txid, &s.path).await?;
+        self.files.insert(LtxFileInfo {
+            level: s.level,
+            min_txid: s.min_txid,
+            max_txid: s.max_txid,
+            size,
+            created_at: Some(SystemTime::now()),
+        });
         self.pos = s.new_pos;
         Ok(s.outcome)
     }
@@ -533,22 +601,27 @@ impl Syncer {
         } else {
             return Ok(None);
         };
-        Ok(Some(self.run_checkpoint(mode).await?))
+        // The frame threshold was crossed, so the WAL grew from real writes:
+        // restart it (seq bump) to keep it bounded.
+        Ok(Some(self.run_checkpoint(mode, true).await?))
     }
 
     /// Runs one stage → checkpoint → upload cycle in `mode`, unconditionally.
-    /// Used by [`Syncer::checkpoint_if_needed`] and the driver's time-based
-    /// checkpoint. Never blocks the writer (beyond a TRUNCATE's reader wait).
+    /// Used by the driver's *time-based* checkpoint. Does **not** restart the WAL
+    /// (no seq bump): the WAL is small on this path, and bumping it would make an
+    /// idle-but-once-written database keep emitting tiny LTX files forever. Never
+    /// blocks the writer (beyond a TRUNCATE's reader wait).
     pub async fn checkpoint_now(
         &mut self,
         mode: CheckpointMode,
     ) -> Result<(CheckpointMode, CheckpointResult), SyncError> {
-        self.run_checkpoint(mode).await
+        self.run_checkpoint(mode, false).await
     }
 
     async fn run_checkpoint(
         &mut self,
         mode: CheckpointMode,
+        restart_wal: bool,
     ) -> Result<(CheckpointMode, CheckpointResult), SyncError> {
         // 1. Stage the frames committed up to now to a fsync'd .ltx — durable
         //    before the checkpoint can fold them into the DB.
@@ -561,7 +634,7 @@ impl Syncer {
         let synced_frames = captured_offset.saturating_sub(WAL_HEADER_SIZE as u64) / frame_size;
 
         // 2. Checkpoint immediately — safe, the frames are already on disk.
-        let result = self.db.checkpoint(mode)?;
+        let result = self.db.checkpoint(mode, restart_wal)?;
 
         // 3. Upload the staged file. A failure leaves it in the staging dir; the
         //    frames are not lost (recovered on the next open()), so surface the
@@ -611,9 +684,9 @@ impl Syncer {
     /// the WAL offset/salts, and that most recent file is what a restart reads to
     /// recover the WAL resume position. Returns `None` if there's nothing worth
     /// compacting (fewer than two uncompacted L0 files).
-    pub async fn compact(&self) -> Result<Option<CompactionInfo>, SyncError> {
-        let l0 = self.client.list_ltx(LEVEL0).await?;
-        let l1 = self.client.list_ltx(SNAPSHOT_LEVEL).await?;
+    pub async fn compact(&mut self) -> Result<Option<CompactionInfo>, SyncError> {
+        let l0 = self.files.list(LEVEL0);
+        let l1 = self.files.list(SNAPSHOT_LEVEL);
 
         let base = l1.iter().find(|f| f.min_txid == 1).copied();
         let base_max = base.map(|f| f.max_txid).unwrap_or(0);
@@ -657,12 +730,14 @@ impl Syncer {
             self.client
                 .delete_ltx(SNAPSHOT_LEVEL, b.min_txid, b.max_txid)
                 .await?;
+            self.files.remove(SNAPSHOT_LEVEL, b.min_txid, b.max_txid);
             pruned += 1;
         }
         for f in to_merge {
             self.client
                 .delete_ltx(LEVEL0, f.min_txid, f.max_txid)
                 .await?;
+            self.files.remove(LEVEL0, f.min_txid, f.max_txid);
             pruned += 1;
         }
 
@@ -682,7 +757,10 @@ impl Syncer {
     /// retention window can keep lower levels readable). Returns `None` when the
     /// destination is already caught up. `dst_level` must be a cascade level
     /// (`1..=8`); full snapshots go through [`Syncer::snapshot`].
-    pub async fn compact_level(&self, dst_level: u32) -> Result<Option<CompactionInfo>, SyncError> {
+    pub async fn compact_level(
+        &mut self,
+        dst_level: u32,
+    ) -> Result<Option<CompactionInfo>, SyncError> {
         if dst_level == 0 || dst_level >= SNAPSHOT_LEVEL {
             return Err(SyncError::InvalidCompactionLevels(format!(
                 "cannot compact into level {dst_level}; use snapshot() for the snapshot level"
@@ -692,18 +770,16 @@ impl Syncer {
 
         // The destination frontier: only pull source files past it.
         let dst_max = self
-            .client
-            .list_ltx(dst_level)
-            .await?
+            .files
+            .list(dst_level)
             .iter()
             .map(|f| f.max_txid)
             .max()
             .unwrap_or(0);
 
         let mut src: Vec<_> = self
-            .client
-            .list_ltx(src_level)
-            .await?
+            .files
+            .list(src_level)
             .into_iter()
             .filter(|f| f.min_txid > dst_max)
             .collect();
@@ -743,15 +819,14 @@ impl Syncer {
     /// with what a restore would produce), so it never re-reads SQLite and never
     /// touches the WAL-resume state carried by the newest L0. Returns `None` if
     /// nothing has been synced yet or a snapshot already covers this position.
-    pub async fn snapshot(&self) -> Result<Option<CompactionInfo>, SyncError> {
-        let files = list_all_levels(&self.client).await?;
+    pub async fn snapshot(&mut self) -> Result<Option<CompactionInfo>, SyncError> {
+        let files = self.files.all_levels();
         let Some(max_txid) = files.iter().map(|(_, _, max)| *max).max() else {
             return Ok(None);
         };
         if self
-            .client
-            .list_ltx(SNAPSHOT_LEVEL)
-            .await?
+            .files
+            .list(SNAPSHOT_LEVEL)
             .iter()
             .any(|f| f.min_txid == 1 && f.max_txid == max_txid)
         {
@@ -788,12 +863,7 @@ impl Syncer {
 
         let tmp = self.compaction_temp(SNAPSHOT_LEVEL, 1, max_txid)?;
         merge_to_writer(&refs, header, BufWriter::new(File::create(&tmp)?))?;
-        let uploaded = self
-            .client
-            .put_ltx_multipart(SNAPSHOT_LEVEL, 1, max_txid, &tmp)
-            .await;
-        fs::remove_file(&tmp).ok();
-        uploaded?;
+        self.upload_merged(SNAPSHOT_LEVEL, 1, max_txid, &tmp).await?;
 
         Ok(Some(CompactionInfo {
             min_txid: 1,
@@ -804,10 +874,10 @@ impl Syncer {
     }
 
     /// Streams a compaction of `refs` into a temp file and uploads it to
-    /// `(level, min, max)` with a multipart (streaming, no-CAS) put, then removes
-    /// the temp. Peak memory is O(inputs + page_size), not O(merged size).
+    /// `(level, min, max)`, then removes the temp. Peak memory is O(inputs +
+    /// page_size), not O(merged size).
     async fn compact_and_upload(
-        &self,
+        &mut self,
         level: u32,
         min: u64,
         max: u64,
@@ -815,9 +885,39 @@ impl Syncer {
     ) -> Result<(), SyncError> {
         let tmp = self.compaction_temp(level, min, max)?;
         compact_to_writer(refs, BufWriter::new(File::create(&tmp)?))?;
-        let uploaded = self.client.put_ltx_multipart(level, min, max, &tmp).await;
-        fs::remove_file(&tmp).ok();
+        self.upload_merged(level, min, max, &tmp).await
+    }
+
+    /// Uploads a compaction/snapshot merge output (no CAS: these files have a
+    /// single writer of their range). Small outputs go in one `put_ltx`; large
+    /// ones stream via multipart. The size split matters at fan-out: routing a
+    /// tiny output through multipart would cost three requests (init, part,
+    /// complete) where a plain put costs one.
+    async fn upload_merged(
+        &mut self,
+        level: u32,
+        min: u64,
+        max: u64,
+        tmp: &Path,
+    ) -> Result<(), SyncError> {
+        let size = fs::metadata(tmp)?.len();
+        let uploaded = if size >= MULTIPART_THRESHOLD {
+            self.client.put_ltx_multipart(level, min, max, tmp).await
+        } else {
+            let bytes = fs::read(tmp)?;
+            self.client
+                .put_ltx(level, min, max, Bytes::from(bytes))
+                .await
+        };
+        fs::remove_file(tmp).ok();
         uploaded?;
+        self.files.insert(LtxFileInfo {
+            level,
+            min_txid: min,
+            max_txid: max,
+            size,
+            created_at: Some(SystemTime::now()),
+        });
         Ok(())
     }
 
@@ -841,16 +941,17 @@ impl Syncer {
     /// snapshot TXID. `now` is passed in for deterministic scheduling. Returns
     /// the minimum retained snapshot TXID (0 if none were kept by age).
     pub async fn enforce_snapshot_retention(
-        &self,
+        &mut self,
         now: SystemTime,
         retention: Duration,
         max_level: u32,
     ) -> Result<u64, SyncError> {
         let cutoff = now.checked_sub(retention).unwrap_or(now);
-        let snaps = self.client.list_ltx(SNAPSHOT_LEVEL).await?;
+        let snaps = self.files.list(SNAPSHOT_LEVEL);
         let (deleted, min_retained) = retention::snapshot_expired(&snaps, cutoff);
         for f in &deleted {
             self.client.delete_ltx(f.level, f.min_txid, f.max_txid).await?;
+            self.files.remove(f.level, f.min_txid, f.max_txid);
         }
         if min_retained > 0 {
             for level in 0..=max_level {
@@ -863,14 +964,15 @@ impl Syncer {
     /// Deletes files at `level` whose `max_txid` is below `txid` (keeping the
     /// newest). Returns the number deleted.
     pub async fn enforce_retention_by_txid(
-        &self,
+        &mut self,
         level: u32,
         txid: u64,
     ) -> Result<usize, SyncError> {
-        let files = self.client.list_ltx(level).await?;
+        let files = self.files.list(level);
         let deleted = retention::below_txid(&files, txid);
         for f in &deleted {
             self.client.delete_ltx(f.level, f.min_txid, f.max_txid).await?;
+            self.files.remove(f.level, f.min_txid, f.max_txid);
         }
         Ok(deleted.len())
     }
@@ -880,7 +982,7 @@ impl Syncer {
     /// always the newest. A zero `retention` disables it. Returns the number
     /// deleted.
     pub async fn enforce_l0_retention(
-        &self,
+        &mut self,
         now: SystemTime,
         retention: Duration,
     ) -> Result<usize, SyncError> {
@@ -889,17 +991,17 @@ impl Syncer {
         }
         let cutoff = now.checked_sub(retention).unwrap_or(now);
         let max_l1 = self
-            .client
-            .list_ltx(1)
-            .await?
+            .files
+            .list(1)
             .iter()
             .map(|f| f.max_txid)
             .max()
             .unwrap_or(0);
-        let files = self.client.list_ltx(LEVEL0).await?;
+        let files = self.files.list(LEVEL0);
         let deleted = retention::l0_expired(&files, max_l1, cutoff);
         for f in &deleted {
             self.client.delete_ltx(f.level, f.min_txid, f.max_txid).await?;
+            self.files.remove(f.level, f.min_txid, f.max_txid);
         }
         Ok(deleted.len())
     }
@@ -1094,19 +1196,16 @@ async fn list_all_levels(client: &ReplicaClient) -> Result<Vec<(u32, u64, u64)>,
 /// only level that carries live WAL state (compaction and snapshots zero those
 /// fields). Retention always keeps the newest L0, so it's normally present; if no
 /// L0 remains, WAL state is unknown and the next sync re-snapshots.
-async fn derive_position(client: &ReplicaClient) -> Result<Position, SyncError> {
-    let files = list_all_levels(client).await?;
-    let Some(&(_, _, txid)) = files.iter().max_by_key(|(_, _, max)| *max) else {
+async fn derive_position(files: &FileIndex, client: &ReplicaClient) -> Result<Position, SyncError> {
+    let all = files.all_levels();
+    let Some(&(_, _, txid)) = all.iter().max_by_key(|(_, _, max)| *max) else {
         return Ok(Position::default());
     };
 
-    let newest_l0 = files
-        .iter()
-        .filter(|(level, _, _)| *level == LEVEL0)
-        .max_by_key(|(_, _, max)| *max);
+    let newest_l0 = files.list(LEVEL0).into_iter().max_by_key(|f| f.max_txid);
 
-    let (wal_offset, salt1, salt2) = if let Some(&(level, min, max)) = newest_l0 {
-        let bytes = client.get_ltx(level, min, max).await?;
+    let (wal_offset, salt1, salt2) = if let Some(f) = newest_l0 {
+        let bytes = client.get_ltx(LEVEL0, f.min_txid, f.max_txid).await?;
         let header = Decoder::new(&bytes[..]).decode_header()?;
         (
             (header.wal_offset + header.wal_size) as u64,

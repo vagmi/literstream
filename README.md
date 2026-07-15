@@ -36,6 +36,18 @@ operate.
 - **Tiered compaction + retention.** Old files are merged into coarser levels on
   a schedule and pruned by age, keeping storage bounded. It is the same model as
   Litestream (raw L0 → time-based levels → full snapshots).
+- **Bounded memory, any size.** Snapshots pread page by page, restores stream to
+  disk, compaction is a streaming k-way merge, and large uploads go out in parts,
+  so replicating or restoring a multi-gigabyte database uses kilobytes of memory,
+  not gigabytes.
+- **Durable by staging.** Each LTX file is written and fsync'd to a local staging
+  directory before the checkpoint that could merge its frames into the database,
+  so a crash between checkpoint and upload loses nothing: the staged file is
+  shipped on the next start.
+- **Built for many databases.** One process can replicate hundreds of small
+  per-tenant databases at once. Memory scales linearly (a fraction of a megabyte
+  each), and steady-state replication never lists the object store (each
+  replicator keeps a local file index), so idle databases cost almost nothing.
 - **Safe by construction.** A single-writer lock plus compare-and-swap uploads
   prevent two processes from corrupting a replica.
 
@@ -49,11 +61,13 @@ literstream opens SQLite in **WAL mode**, disables SQLite's
 automatic checkpointing so *it* decides when checkpoints happen, and holds a
 long-lived **read transaction** that pins a spot in the WAL so a checkpoint can
 never overwrite frames before they've been copied out. It reads the new WAL
-frames, encodes them as **LTX** files, and writes them to the object store with
-an **atomic, if-not-exists** upload. Restoring just replays that file chain back
-into a database image.
+frames, encodes them as **LTX** files, **stages them to a local directory and
+fsyncs them** for durability, then uploads them to the object store (a small file
+goes up with an **atomic, if-not-exists** write; a large one streams in parts).
+Restoring just replays that file chain back into a database image.
 
-For the full story, see **[docs/how-it-works.md](docs/how-it-works.md)**.
+For the full story, including how one process cheaply replicates a fleet of small
+databases, see **[docs/how-it-works.md](docs/how-it-works.md)**.
 
 ## Quick start
 
@@ -149,11 +163,19 @@ Runnable examples live in [`examples/`](examples):
 - `00_simple_usage.rs`: the five-step replicate-and-restore path above.
 - `01_complete.rs`: a full `Driver` loop: random traffic, tiered compaction,
   retention, and point-in-time recovery, narrated as it runs.
+- `fanout_bench.rs`: replicates N databases at once to a real or local object
+  store and reports memory, correctness, and a per-operation request count. It
+  wraps the store to tally every operation, so the output is a request budget.
 
 ```sh
 cargo run --example 00_simple_usage
 LITERSTREAM_DEMO_SECS=90 cargo run --example 01_complete
+FANOUT_LOCAL=/tmp/replica FANOUT_N=100 cargo run --release --example fanout_bench
 ```
+
+To estimate the object-store operations and monthly cost for a fleet at your own
+intervals, edit the constants in and run
+[`scripts/ops-estimate.py`](scripts/ops-estimate.py).
 
 ## Acknowledgements
 

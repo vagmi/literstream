@@ -616,7 +616,7 @@ async fn driver_compacts_during_workload_and_preserves_pitr() {
     // compaction destroying history.
     let (last_txid, _) = *marks.last().unwrap();
     driver
-        .syncer()
+        .syncer_mut()
         .enforce_retention_by_txid(0, last_txid)
         .await
         .unwrap();
@@ -847,6 +847,51 @@ async fn time_based_checkpoint_folds_a_low_write_wal() {
         r1.checkpoint.is_none(),
         "no checkpoint before the interval elapses"
     );
+
+    let image = restore(&client).await.unwrap();
+    assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 5));
+}
+
+/// A database written once and then left idle must stop producing LTX files.
+/// Before the seq-bump gate, the time-based checkpoint's `_litestream_seq` bump
+/// was itself a WAL write that the next sync shipped as a tiny L0 file, which
+/// re-triggered the checkpoint — a perpetual, write-free cost. It must not grow.
+#[tokio::test]
+async fn idle_database_stops_producing_ltx_files() {
+    use literstream::sync::{CompactionLevels, Driver};
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let tc = TempCase::new("idle-quiet");
+    let db = Db::open(&tc.db_path).unwrap();
+    let client = memory_client();
+    let syncer = Syncer::open(db, client.clone()).await.unwrap();
+    // Aggressive time-based checkpoint; no snapshots or L0 retention so the L0
+    // file count reflects exactly what replication produced.
+    let mut driver = Driver::new(syncer, CompactionLevels::default())
+        .with_checkpoint_interval(Duration::from_secs(1))
+        .with_snapshot_interval(Duration::ZERO)
+        .with_l0_retention(Duration::ZERO);
+
+    let w = writer(&tc.db_path);
+    ensure_table(&w);
+    insert_range(&w, 1, 6, "x"); // one write, then idle forever
+
+    let base = UNIX_EPOCH + Duration::from_secs(10_000);
+    for i in 0..20 {
+        driver.tick(base + Duration::from_secs(i * 2)).await.unwrap();
+    }
+    let after_20 = client.list_ltx(0).await.unwrap().len();
+
+    for i in 20..40 {
+        driver.tick(base + Duration::from_secs(i * 2)).await.unwrap();
+    }
+    let after_40 = client.list_ltx(0).await.unwrap().len();
+
+    assert_eq!(
+        after_20, after_40,
+        "idle database kept producing L0 files (seq-bump loop): {after_20} -> {after_40}"
+    );
+    assert!(after_40 <= 2, "expected a bounded handful of L0 files, got {after_40}");
 
     let image = restore(&client).await.unwrap();
     assert_eq!(validate_image(&tc.dir, &image), ("ok".into(), 5));

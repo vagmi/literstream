@@ -84,12 +84,12 @@ fn passive_checkpoint_drains_then_truncate_empties() {
 
     // PASSIVE moves every frame into the DB (no other readers) but leaves the
     // -wal file in place.
-    let r = db.checkpoint(CheckpointMode::Passive).unwrap();
+    let r = db.checkpoint(CheckpointMode::Passive, true).unwrap();
     assert!(r.fully_checkpointed(), "not fully checkpointed: {r:?}");
     assert!(db.wal_size() > 0, "PASSIVE should not truncate the file");
 
     // TRUNCATE empties the -wal file on disk.
-    let r = db.checkpoint(CheckpointMode::Truncate).unwrap();
+    let r = db.checkpoint(CheckpointMode::Truncate, true).unwrap();
     assert!(!r.busy);
     assert_eq!(db.wal_size(), 0, "TRUNCATE should empty the -wal file");
 
