@@ -32,7 +32,7 @@ use crate::db::{CheckpointMode, CheckpointResult, Db};
 use crate::lock::ProcessLock;
 use crate::ltx::{
     Checksum, Decoder, Encoder, HEADER_FLAG_NO_CHECKSUM, HEADER_SIZE, Header, INDEX_FOOTER_SIZE,
-    compact, decode_page_frame, decode_page_index, lock_pgno, read_file,
+    compact_to_writer, decode_page_frame, decode_page_index, lock_pgno, merge_to_writer, read_file,
 };
 use crate::storage::{PutOutcome, ReplicaClient};
 use crate::wal::{
@@ -646,11 +646,11 @@ impl Syncer {
 
         let refs: Vec<&[u8]> = buffers.iter().map(|b| b.as_ref()).collect();
         let inputs = refs.len();
-        let merged = compact(&refs)?;
 
-        // Publish the new base, then delete what it supersedes.
-        self.client
-            .put_ltx(SNAPSHOT_LEVEL, 1, new_max, Bytes::from(merged))
+        // Publish the new base, then delete what it supersedes. The merge streams
+        // page-by-page into a temp file and uploads it in parts, so peak memory is
+        // O(inputs + page_size), not O(merged size).
+        self.compact_and_upload(SNAPSHOT_LEVEL, 1, new_max, &refs)
             .await?;
         let mut pruned = 0;
         if let Some(b) = base {
@@ -723,10 +723,8 @@ impl Syncer {
         }
         let refs: Vec<&[u8]> = buffers.iter().map(|b| b.as_ref()).collect();
         let inputs = refs.len();
-        let merged = compact(&refs)?;
 
-        self.client
-            .put_ltx(dst_level, min_txid, max_txid, Bytes::from(merged))
+        self.compact_and_upload(dst_level, min_txid, max_txid, &refs)
             .await?;
 
         Ok(Some(CompactionInfo {
@@ -762,42 +760,40 @@ impl Syncer {
 
         let plan = plan_restore(&files)?;
         let inputs = plan.len();
-        let image = apply_plan(&self.client, &plan).await?;
 
-        let page_size = self.db.page_size() as usize;
-        let commit = (image.len() / page_size) as u32;
-        let lock = lock_pgno(page_size as u32);
-
-        let mut buf = Vec::new();
-        {
-            let mut enc = Encoder::new(&mut buf);
-            enc.encode_header(Header {
-                flags: HEADER_FLAG_NO_CHECKSUM,
-                page_size: page_size as u32,
-                commit,
-                min_txid: 1,
-                max_txid,
-                timestamp: now_ms(),
-                pre_apply_checksum: Checksum::ZERO,
-                wal_offset: 0,
-                wal_size: 0,
-                wal_salt1: 0,
-                wal_salt2: 0,
-                node_id: 0,
-            })?;
-            for pgno in 1..=commit {
-                if pgno == lock {
-                    continue;
-                }
-                let start = (pgno as usize - 1) * page_size;
-                enc.encode_page(pgno, &image[start..start + page_size])?;
-            }
-            enc.finish()?;
+        // Fetch the plan files and stream-merge them into the snapshot, newest
+        // page winning, one page at a time. The final size comes from the newest
+        // file's header (a VACUUM may have shrunk the database).
+        let mut buffers: Vec<Bytes> = Vec::with_capacity(plan.len());
+        for &(level, min, max) in &plan {
+            buffers.push(self.client.get_ltx(level, min, max).await?);
         }
+        let refs: Vec<&[u8]> = buffers.iter().map(|b| b.as_ref()).collect();
+        let newest = Header::decode(refs.last().expect("restore plan is non-empty"))?;
 
-        self.client
-            .put_ltx(SNAPSHOT_LEVEL, 1, max_txid, Bytes::from(buf))
-            .await?;
+        let header = Header {
+            flags: HEADER_FLAG_NO_CHECKSUM,
+            page_size: newest.page_size,
+            commit: newest.commit,
+            min_txid: 1,
+            max_txid,
+            timestamp: now_ms(),
+            pre_apply_checksum: Checksum::ZERO,
+            wal_offset: 0,
+            wal_size: 0,
+            wal_salt1: 0,
+            wal_salt2: 0,
+            node_id: 0,
+        };
+
+        let tmp = self.compaction_temp(SNAPSHOT_LEVEL, 1, max_txid)?;
+        merge_to_writer(&refs, header, BufWriter::new(File::create(&tmp)?))?;
+        let uploaded = self
+            .client
+            .put_ltx_multipart(SNAPSHOT_LEVEL, 1, max_txid, &tmp)
+            .await;
+        fs::remove_file(&tmp).ok();
+        uploaded?;
 
         Ok(Some(CompactionInfo {
             min_txid: 1,
@@ -805,6 +801,39 @@ impl Syncer {
             inputs,
             pruned: 0,
         }))
+    }
+
+    /// Streams a compaction of `refs` into a temp file and uploads it to
+    /// `(level, min, max)` with a multipart (streaming, no-CAS) put, then removes
+    /// the temp. Peak memory is O(inputs + page_size), not O(merged size).
+    async fn compact_and_upload(
+        &self,
+        level: u32,
+        min: u64,
+        max: u64,
+        refs: &[&[u8]],
+    ) -> Result<(), SyncError> {
+        let tmp = self.compaction_temp(level, min, max)?;
+        compact_to_writer(refs, BufWriter::new(File::create(&tmp)?))?;
+        let uploaded = self.client.put_ltx_multipart(level, min, max, &tmp).await;
+        fs::remove_file(&tmp).ok();
+        uploaded?;
+        Ok(())
+    }
+
+    /// A scratch path for a compaction or snapshot merge output, under this
+    /// database's own `<db>-litestream/compact/` directory (not the system temp,
+    /// so concurrent syncers on different databases never collide, and not under
+    /// `ltx/`, so recovery never mistakes it for a staged file). Compaction is
+    /// idempotent and re-runnable, so this file is not fsync'd or recovered.
+    fn compaction_temp(&self, level: u32, min: u64, max: u64) -> Result<PathBuf, SyncError> {
+        let dir = self
+            .staging
+            .parent()
+            .unwrap_or(&self.staging)
+            .join("compact");
+        fs::create_dir_all(&dir)?;
+        Ok(dir.join(format!("{level:04x}-{min:016x}-{max:016x}.ltx")))
     }
 
     /// Deletes snapshots older than `retention` (keeping the newest), then

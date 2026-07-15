@@ -275,6 +275,24 @@ pub fn read_file(bytes: &[u8]) -> Result<DecodedFile, LtxError> {
     })
 }
 
+/// Extracts a file's page index (pgno-ascending) by locating the footer, without
+/// decoding any page data. Cheaper than [`read_file`] when only the offsets are
+/// needed (e.g. a streaming k-way merge).
+pub fn page_index(bytes: &[u8]) -> Result<Vec<PageIndexElem>, LtxError> {
+    let footer = INDEX_FOOTER_SIZE as usize;
+    if bytes.len() < HEADER_SIZE + footer {
+        return Err(LtxError::ShortBuffer {
+            need: HEADER_SIZE + footer,
+            got: bytes.len(),
+        });
+    }
+    let index_size_at = bytes.len() - footer;
+    let index_len =
+        u64::from_be_bytes(bytes[index_size_at..index_size_at + 8].try_into().unwrap()) as usize;
+    let index_start = index_size_at - index_len;
+    decode_page_index(&bytes[index_start..index_size_at])
+}
+
 /// Parses the page index: `varint(pgno, offset, size)...` up to a `varint(0)`
 /// end marker. (The trailing u64 index-size is not needed here.)
 pub fn decode_page_index(mut b: &[u8]) -> Result<Vec<PageIndexElem>, LtxError> {

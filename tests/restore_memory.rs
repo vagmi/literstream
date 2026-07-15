@@ -120,6 +120,9 @@ async fn snapshot_and_restore_stay_under_a_memory_ceiling() {
     let db = Db::open(&db_path).unwrap();
     let mut syncer = Syncer::open(db, client.clone()).await.unwrap();
     syncer.sync().await.unwrap();
+    // Rebuild the L9 snapshot from the chain (exercises the streaming k-way merge
+    // in snapshot(), which must not materialize the whole image either).
+    syncer.snapshot().await.unwrap();
     drop(syncer);
 
     // Restore straight to disk (exercises restore_to_path's streamed pwrite).

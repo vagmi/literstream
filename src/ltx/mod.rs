@@ -27,10 +27,10 @@ mod error;
 mod format;
 
 pub use checksum::{CHECKSUM_FLAG, Checksum, Hasher, checksum_page};
-pub use compactor::compact;
+pub use compactor::{compact, compact_to_writer, merge_to_writer};
 pub use decoder::{
     DecodedFile, Decoder, INDEX_FOOTER_SIZE, PageIndexElem, Snapshot, decode_page_frame,
-    decode_page_index, read_file, read_snapshot,
+    decode_page_index, page_index, read_file, read_snapshot,
 };
 pub use encoder::{Encoder, write_snapshot};
 pub use error::LtxError;
