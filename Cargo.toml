@@ -21,10 +21,13 @@ tokio = { version = "1.52.3", features = [
     "time",
     "signal",
 ], optional = true }
+# CLI-only: argument parsing and RFC 3339 timestamp parsing for `restore --timestamp`.
+clap = { version = "4", features = ["derive"], optional = true }
+jiff = { version = "0.2", optional = true }
 
 [features]
 # Builds the `literstream` replicate daemon binary.
-cli = ["dep:tokio"]
+cli = ["dep:tokio", "dep:clap", "dep:jiff"]
 
 [[bin]]
 name = "literstream"

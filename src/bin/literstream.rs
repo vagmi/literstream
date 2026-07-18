@@ -11,39 +11,70 @@
 //! runs the [`Driver`] once per second — sync, checkpoint, tiered compaction,
 //! snapshots, retention — until Ctrl-C, then drains.
 //!
-//!     literstream replicate <db-path>  <replica-dir | s3://prefix | gs://bucket/prefix>
-//!     literstream restore   <out-path> <replica-dir | s3://prefix | gs://bucket/prefix>
+//!     literstream replicate <db-path>  <replica>
+//!     literstream restore   [--txid N | --timestamp T] <replica> <out-path>
+//!
+//! where `<replica>` is `<dir> | s3://<prefix> | gs://<bucket>/<prefix>`.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use clap::{Parser, Subcommand};
+use jiff::Timestamp;
 use literstream::db::Db;
 use literstream::storage::ReplicaClient;
-use literstream::sync::{CompactionLevels, Driver, Syncer, restore};
+use literstream::sync::{
+    CompactionLevels, Driver, Syncer, restore_to_path, restore_to_timestamp, restore_to_txid,
+};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
+
+/// Continuous SQLite replication to object storage, and restore.
+#[derive(Parser)]
+#[command(name = "literstream", version, about, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Continuously replicate a live database to a replica until Ctrl-C.
+    Replicate {
+        /// Path to the SQLite database to replicate.
+        db_path: String,
+        /// Replica destination: a directory, `s3://<prefix>`, or `gs://<bucket>/<prefix>`.
+        replica: String,
+    },
+    /// Rebuild a database from a replica (optionally at a point in time).
+    Restore {
+        /// Restore the state as of this transaction ID (point-in-time recovery).
+        #[arg(long, conflicts_with = "timestamp")]
+        txid: Option<u64>,
+        /// Restore the state as of this time: an RFC 3339 datetime
+        /// (e.g. `2026-07-16T10:30:00Z`) or Unix epoch milliseconds.
+        #[arg(long)]
+        timestamp: Option<String>,
+        /// Replica source: a directory, `s3://<prefix>`, or `gs://<bucket>/<prefix>`.
+        replica: String,
+        /// Path to write the reconstructed database to.
+        out_path: String,
+    },
+}
 
 // A single-threaded runtime: the replicator is one I/O-bound task, so worker
 // threads would only add baseline memory.
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let args: Vec<String> = std::env::args().collect();
-    match args.get(1).map(String::as_str) {
-        Some("replicate") if args.len() >= 4 => replicate(&args).await,
-        Some("restore") if args.len() >= 4 => restore_cmd(&args).await,
-        _ => {
-            eprintln!("usage:");
-            eprintln!(
-                "  {} replicate <db-path>  <replica-dir | s3://prefix | gs://bucket/prefix>",
-                args[0]
-            );
-            eprintln!(
-                "  {} restore   <out-path> <replica-dir | s3://prefix | gs://bucket/prefix>",
-                args[0]
-            );
-            std::process::exit(2);
-        }
+    match Cli::parse().command {
+        Command::Replicate { db_path, replica } => replicate(&db_path, &replica).await,
+        Command::Restore {
+            txid,
+            timestamp,
+            replica,
+            out_path,
+        } => restore_cmd(txid, timestamp.as_deref(), &replica, &out_path).await,
     }
 }
 
@@ -82,21 +113,53 @@ fn replica_client(replica: &str) -> ReplicaClient {
     }
 }
 
-/// Rebuilds the database from the replica and writes it to `out-path`.
-async fn restore_cmd(args: &[String]) {
-    let out_path = &args[2];
-    let client = replica_client(&args[3]);
-    let image = restore(&client).await.expect("restore");
-    std::fs::write(out_path, &image).expect("write image");
-    eprintln!("restored {} bytes -> {out_path}", image.len());
+/// Parses `--timestamp`: an RFC 3339 datetime, or a bare integer read as Unix
+/// epoch milliseconds. Returns milliseconds since the Unix epoch.
+fn parse_timestamp_ms(s: &str) -> i64 {
+    if let Ok(ms) = s.parse::<i64>() {
+        return ms;
+    }
+    s.parse::<Timestamp>()
+        .unwrap_or_else(|e| panic!("invalid --timestamp {s:?}: {e} (want RFC 3339 or epoch ms)"))
+        .as_millisecond()
 }
 
-async fn replicate(args: &[String]) {
-    let db_path = args[2].clone();
-    let replica = args[3].clone();
+/// Rebuilds the database from the replica and writes it to `out_path`. With
+/// `--txid`/`--timestamp` it reconstructs an earlier point in time; otherwise it
+/// streams the latest state straight to disk with bounded memory.
+async fn restore_cmd(txid: Option<u64>, timestamp: Option<&str>, replica: &str, out_path: &str) {
+    let client = replica_client(replica);
+    match (txid, timestamp) {
+        (Some(txid), _) => {
+            let result = restore_to_txid(&client, txid).await.expect("restore");
+            std::fs::write(out_path, &result.image).expect("write image");
+            eprintln!(
+                "restored {} bytes as of txid {} -> {out_path}",
+                result.image.len(),
+                result.txid,
+            );
+        }
+        (None, Some(ts)) => {
+            let ms = parse_timestamp_ms(ts);
+            let result = restore_to_timestamp(&client, ms).await.expect("restore");
+            std::fs::write(out_path, &result.image).expect("write image");
+            eprintln!(
+                "restored {} bytes as of txid {} (<= {ts}) -> {out_path}",
+                result.image.len(),
+                result.txid,
+            );
+        }
+        (None, None) => {
+            let path = std::path::Path::new(out_path);
+            let txid = restore_to_path(&client, path).await.expect("restore");
+            eprintln!("restored latest (txid {txid}) -> {out_path}");
+        }
+    }
+}
 
-    let client = replica_client(&replica);
-    let db = Db::open(&db_path).expect("open db");
+async fn replicate(db_path: &str, replica: &str) {
+    let client = replica_client(replica);
+    let db = Db::open(db_path).expect("open db");
     // Litestream's default cascade: L1@30s, L2@5m, L3@1h + snapshots + retention.
     let mut driver = Driver::new(syncer(db, client).await, CompactionLevels::default_levels());
 
