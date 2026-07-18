@@ -1,6 +1,6 @@
 # literstream
 
-**Continuously back up a live SQLite database to object storage — as a Rust library.**
+**Continuously back up a live SQLite database to object storage as a Rust library**
 
 literstream watches a running SQLite database and streams every change to an
 object store (S3, GCS, Azure, local disk, or in-memory) as a chain of small,
