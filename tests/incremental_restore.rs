@@ -19,8 +19,8 @@ use literstream::db::Db;
 use literstream::ltx::Header;
 use literstream::storage::ReplicaClient;
 use literstream::sync::{
-    CatchUp, FallbackReason, SyncError, Syncer, catch_up, restore_incremental, restore_to_path,
-    restore_to_txid,
+    CatchUp, FallbackReason, SyncError, Syncer, catch_up, record_position, restore_incremental,
+    restore_to_path, restore_to_txid,
 };
 use object_store::memory::InMemory;
 use object_store::{
@@ -737,4 +737,106 @@ async fn catch_up_is_idempotent_and_lands_on_the_full_image() {
     let full = tc.out("full.db");
     restore_to_path(&client, &full).await.unwrap();
     assert_eq!(std::fs::read(&out).unwrap(), std::fs::read(&full).unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// record_position — keeping a *writer's* own copy warm
+// ---------------------------------------------------------------------------
+
+/// Run a writer against `db_path`, replicate it, then close everything down the
+/// way a session would: flush, drop the syncer, checkpoint. Returns the
+/// replicated TXID.
+async fn write_and_close(tc: &TempCase, client: &ReplicaClient, lo: i64, hi: i64) -> u64 {
+    let mut syncer = Syncer::open(Db::open(&tc.db_path).unwrap(), client.clone())
+        .await
+        .unwrap();
+    {
+        let w = writer(&tc.db_path);
+        ensure_table(&w);
+        insert_range(&w, lo, hi, "work");
+    }
+    syncer.flush().await.unwrap();
+    let txid = syncer.position_txid();
+    drop(syncer); // releases the single-writer lock and the WAL read mark
+
+    // Fold the WAL in, so the file has stopped moving before it is stamped.
+    let c = Connection::open(&tc.db_path).unwrap();
+    c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(())).unwrap();
+    drop(c);
+    txid
+}
+
+/// The case `record_position` exists for: a process that wrote the transactions
+/// itself can reopen its own file without rebuilding it.
+#[tokio::test]
+async fn a_writers_own_copy_stays_warm() {
+    let tc = TempCase::new("writer-warm");
+    let client = memory_client();
+
+    let txid = write_and_close(&tc, &client, 1, 400).await;
+    record_position(&tc.db_path, txid).unwrap();
+
+    assert_eq!(
+        catch_up(&client, &tc.db_path).await.unwrap(),
+        CatchUp::UpToDate { txid },
+        "a writer that stamped its own position should have nothing to do"
+    );
+}
+
+/// The negative control. Without the stamp the file is indistinguishable from
+/// one nobody has vouched for, and the whole image comes back down the wire —
+/// which is the bug `record_position` closes.
+#[tokio::test]
+async fn a_writer_that_does_not_stamp_rebuilds_from_scratch() {
+    let tc = TempCase::new("writer-cold");
+    let client = memory_client();
+
+    write_and_close(&tc, &client, 1, 400).await;
+
+    match catch_up(&client, &tc.db_path).await.unwrap() {
+        CatchUp::FullRestore { reason, .. } => assert_eq!(reason, FallbackReason::NoMarker),
+        other => panic!("expected a full restore without a marker, got {other:?}"),
+    }
+}
+
+/// The handover loop end to end: we write and release, somebody else advances
+/// the replica, we come back and apply only their delta.
+#[tokio::test]
+async fn a_stamped_copy_catches_up_on_someone_elses_writes() {
+    let tc = TempCase::new("writer-handover");
+    let client = memory_client();
+
+    let ours = write_and_close(&tc, &client, 1, 400).await;
+    record_position(&tc.db_path, ours).unwrap();
+
+    // Another process takes over: restores the replica elsewhere, writes, ships.
+    let theirs_db = tc.out("theirs.db");
+    restore_to_path(&client, &theirs_db).await.unwrap();
+    let mut syncer = Syncer::open(Db::open(&theirs_db).unwrap(), client.clone())
+        .await
+        .unwrap();
+    {
+        let w = writer(&theirs_db);
+        insert_range(&w, 5000, 5200, "theirs");
+    }
+    syncer.flush().await.unwrap();
+    let theirs = syncer.position_txid();
+    drop(syncer);
+    assert!(theirs > ours);
+
+    match catch_up(&client, &tc.db_path).await.unwrap() {
+        CatchUp::Incremental { from, to, .. } => {
+            assert_eq!(from, ours);
+            assert_eq!(to, theirs);
+        }
+        other => panic!("expected an incremental catch-up, got {other:?}"),
+    }
+
+    // And it lands on the same bytes a cold rebuild would have produced.
+    let full = tc.out("full.db");
+    restore_to_path(&client, &full).await.unwrap();
+    assert_eq!(
+        std::fs::read(&tc.db_path).unwrap(),
+        std::fs::read(&full).unwrap()
+    );
 }

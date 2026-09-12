@@ -56,8 +56,9 @@ pub use reader::ReplicaReader;
 // `mod restore` and `fn restore` coexist: modules live in the type namespace,
 // functions in the value namespace.
 pub use restore::{
-    CatchUp, FallbackReason, RestoreResult, catch_up, restore, restore_incremental,
-    restore_to_path, restore_to_timestamp, restore_to_txid,
+    CatchUp, FallbackReason, RestoreResult, catch_up, record_position, restore,
+    restore_incremental, restore_to_path, restore_to_timestamp, restore_to_txid,
+    read_marker, Marker
 };
 
 /// Default WAL-frame growth before a checkpoint (~4 MB @ 4 KB), mirroring

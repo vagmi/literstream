@@ -438,7 +438,7 @@ pub async fn restore_to_timestamp(
 /// neither 481 nor 530, and no way to tell.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(tag = "state", rename_all = "lowercase")]
-enum Marker {
+pub enum Marker {
     Clean {
         txid: u64,
         page_size: u32,
@@ -464,7 +464,7 @@ fn marker_path(db_path: &Path) -> PathBuf {
 /// understand — collapses to `None`: "we know nothing", so rebuild from scratch.
 /// None of them is worth surfacing as an error, because the fallback is always
 /// correct and only ever slower.
-fn read_marker(db_path: &Path) -> Option<Marker> {
+pub fn read_marker(db_path: &Path) -> Option<Marker> {
     serde_json::from_slice(&fs::read(marker_path(db_path)).ok()?).ok()
 }
 
@@ -501,6 +501,43 @@ fn local_page_size(path: &Path) -> Option<u32> {
         1 => Some(65536),
         n => Some(n as u32),
     }
+}
+
+/// Record that the database at `db_path` reflects `txid`, so a later
+/// [`catch_up`] can apply a delta instead of rebuilding the whole image.
+///
+/// [`catch_up`] and [`restore_to_path`] already stamp this after writing an
+/// image. This is for the other way a local file becomes current: a process that
+/// *wrote* the transactions itself and replicated them. Without it, a writer's
+/// own changes make the file disagree with the marker it restored under, and its
+/// next `catch_up` throws away a perfectly good local copy
+/// ([`FallbackReason::LengthMismatch`]) — defeating the warm cache for exactly
+/// the process that did the work.
+///
+/// Call it **after** the last flush and checkpoint, when the file has stopped
+/// moving: the marker records the file's current length, and a length recorded
+/// before a checkpoint folds the WAL in will not match afterwards. `txid` is the
+/// replicated position — [`Syncer::position_txid`] after
+/// [`Syncer::flush`](crate::sync::Syncer::flush).
+///
+/// Passing a `txid` the replica has not actually received is the same unchecked
+/// claim [`restore_incremental`] documents, with the same consequence.
+pub fn record_position(db_path: &Path, txid: u64) -> Result<(), SyncError> {
+    let page_size = local_page_size(db_path)
+        .ok_or(SyncError::Ltx(crate::ltx::LtxError::InvalidPageSize(0)))?;
+    let file_len = fs::metadata(db_path)?.len();
+    // `commit` is the database size in pages, which is what the file length
+    // says once it is quiescent.
+    let commit = (file_len / page_size as u64) as u32;
+    write_marker(
+        db_path,
+        &Marker::Clean {
+            txid,
+            page_size,
+            commit,
+            file_len,
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
