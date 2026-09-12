@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use crate::ltx::{HEADER_SIZE, Header, INDEX_FOOTER_SIZE, decode_page_frame, decode_page_index};
 use crate::storage::ReplicaClient;
 
-use super::{SyncError, list_all_levels, plan_restore, plan_restore_to};
+use super::SyncError;
+use super::restore::{list_all_levels, plan_restore, plan_restore_to};
 
 type FileKey = (u32, u64, u64); // (level, min_txid, max_txid)
 

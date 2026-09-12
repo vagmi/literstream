@@ -1,7 +1,5 @@
 # How literstream works
 
-This is the plain-language tour. No prior knowledge of SQLite internals needed. Let us build up the ideas one at a time. 
-
 literstream continuously copies a **live** SQLite database to object storage so
 you can rebuild it later. You can restore to the latest version or as it looked at some earlier
 moment. The trick is doing this *while the database is being written to*, without
@@ -230,6 +228,43 @@ The result is a byte-perfect database file you can open directly.
 - **Straight to disk:** `restore_to_path()` writes the rebuilt database to a file
   one page at a time, so restoring a large database never holds the whole image in
   memory.
+- **Incrementally:** `catch_up()` takes a local copy that is merely stale and
+  applies only the files written since, so the cost tracks what changed instead of
+  the database size.
+
+### Catching up instead of rebuilding
+
+Rebuilding from transaction 1 is correct because it starts from a known anchor. An
+incremental restore has no such anchor: it has to *believe* that the file on disk
+really is at some transaction, and the chain can't confirm it. Every file carries
+`HeaderFlagNoChecksum` with a zero pre-apply checksum — deliberately, because
+Litestream's restore rejects files that carry a rolling checksum — so there is no
+in-band way to verify the claim. Believing a number that is too high skips exactly
+the files holding the missing pages, and the result decodes, opens, and answers
+queries wrongly.
+
+So literstream makes the claim itself rather than accepting one. Every
+`restore_to_path()` writes a small JSON marker beside the database at
+`<db>-litestream/RESTORED`, recording the transaction, page size, and file length
+it just produced. `catch_up()` trusts only that marker, cross-checks the length
+against the real file, and rebuilds from scratch whenever anything doesn't line up.
+
+The marker is written in two phases — `applying` before the first page lands,
+`clean` after the fsync — so a crash mid-apply leaves evidence that the file is a
+mixture of two images rather than a marker that quietly lies about it. Each write
+is a tmp file, an fsync, a rename, and a directory fsync, the same recipe the
+staging directory uses, so the marker itself is never observed half-written.
+
+Given a trustworthy starting point, the delta is the same greedy cover as a full
+restore, just anchored at the local transaction instead of at 1. The first file it
+picks usually *straddles* that point — covering transactions already present as
+well as new ones — and applying it whole is correct, because an LTX file holds the
+latest version of each page in its range, so the overlap rewrites identical bytes.
+Before touching anything, the applier reads each delta file's 100-byte header to
+learn the final size, the smallest size the database passed through, and the page
+size; it resizes to that low-water mark and back up before applying, so a VACUUM
+inside the delta can't leave stale bytes behind, and a changed page size is refused
+rather than written at the wrong offsets.
 
 There's also a `ReplicaReader` that fetches *individual pages* straight from the
 replica with ranged reads. This is what enables reading a database directly from

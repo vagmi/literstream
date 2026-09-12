@@ -27,6 +27,13 @@ pub enum SyncError {
     TxidTooOld {
         requested: u64,
     },
+    /// No contiguous run of LTX files reaches HEAD from `from`, so an
+    /// incremental restore cannot bridge the gap — the covering files were
+    /// compacted into a coarser level and retention-pruned, or the local copy
+    /// predates the oldest retained file. A full restore still works.
+    ChainGap {
+        from: u64,
+    },
     /// A compaction-levels configuration was rejected during validation.
     InvalidCompactionLevels(String),
 }
@@ -50,6 +57,9 @@ impl fmt::Display for SyncError {
             }
             SyncError::TxidTooOld { requested } => {
                 write!(f, "txid {requested} is older than the oldest retained file")
+            }
+            SyncError::ChainGap { from } => {
+                write!(f, "no contiguous ltx chain from txid {from} to head")
             }
             SyncError::InvalidCompactionLevels(msg) => {
                 write!(f, "invalid compaction levels: {msg}")

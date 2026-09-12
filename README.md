@@ -33,6 +33,10 @@ operate.
   change.
 - **Point-in-time recovery.** Restore the latest state, or rewind to a specific
   transaction ID or wall-clock timestamp.
+- **Incremental restore.** A local copy that has fallen behind is caught up by
+  downloading only the LTX files written since, so reattaching a warm database is
+  proportional to what changed rather than to the database. `catch_up()` falls
+  back to a full rebuild whenever the delta is not provably safe.
 - **Tiered compaction + retention.** Old files are merged into coarser levels on
   a schedule and pruned by age, keeping storage bounded. It is the same model as
   Litestream (raw L0 → time-based levels → full snapshots).
@@ -154,6 +158,39 @@ let at_txid = restore_to_txid(&client, 1042).await?;
 
 // ...or as of a wall-clock time (milliseconds since the Unix epoch).
 let at_time = restore_to_timestamp(&client, 1_752_000_000_000).await?;
+```
+
+### Catching a warm copy up
+
+A caller keeping a bounded cache of attached databases — one per tenant, control
+moving between processes — already holds a local file that is merely stale.
+`catch_up` makes it current by downloading only the delta:
+
+```rust
+use literstream::sync::{CatchUp, catch_up};
+
+match catch_up(&client, Path::new("tenant-42.db")).await? {
+    CatchUp::UpToDate { txid }              => {} // nobody wrote; nothing fetched
+    CatchUp::Incremental { from, to, files } => {} // applied `files` delta files
+    CatchUp::FullRestore { to, reason }      => {} // rebuilt; `reason` says why
+}
+```
+
+Use it as the *only* restore call: with no local file it does a full restore, and
+it falls back to one whenever the incremental path is not provably safe — a
+missing or dirty position marker, a file that isn't the size the marker claims, a
+compaction that pruned the chain, a changed page size.
+
+Nothing in the LTX chain says which transaction a local file reflects (literstream
+writes `HeaderFlagNoChecksum` for Litestream compatibility), so literstream writes
+that claim itself: a small JSON marker at `<db>-litestream/RESTORED`, written
+two-phase so an interrupted apply is detected rather than trusted. Every
+`restore_to_path` leaves one, so the first catch-up after a normal restore is free.
+
+From the CLI:
+
+```sh
+literstream restore --incremental <replica> <out-path>
 ```
 
 ## Examples

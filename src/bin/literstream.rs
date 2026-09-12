@@ -12,7 +12,7 @@
 //! snapshots, retention — until Ctrl-C, then drains.
 //!
 //!     literstream replicate <db-path>  <replica>
-//!     literstream restore   [--txid N | --timestamp T] <replica> <out-path>
+//!     literstream restore   [--txid N | --timestamp T | --incremental] <replica> <out-path>
 //!
 //! where `<replica>` is `<dir> | s3://<prefix> | gs://<bucket>/<prefix>`.
 
@@ -24,7 +24,8 @@ use jiff::Timestamp;
 use literstream::db::Db;
 use literstream::storage::ReplicaClient;
 use literstream::sync::{
-    CompactionLevels, Driver, Syncer, restore_to_path, restore_to_timestamp, restore_to_txid,
+    CompactionLevels, Driver, Syncer, catch_up, restore_to_path, restore_to_timestamp,
+    restore_to_txid,
 };
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
@@ -56,6 +57,12 @@ enum Command {
         /// (e.g. `2026-07-16T10:30:00Z`) or Unix epoch milliseconds.
         #[arg(long)]
         timestamp: Option<String>,
+        /// Bring an existing local copy up to date by downloading only the LTX
+        /// files written since it was last restored, falling back to a full
+        /// rebuild when that is not provably safe. Reads the position marker
+        /// literstream left at `<out-path>-litestream/RESTORED`.
+        #[arg(long, conflicts_with_all = ["txid", "timestamp"])]
+        incremental: bool,
         /// Replica source: a directory, `s3://<prefix>`, or `gs://<bucket>/<prefix>`.
         replica: String,
         /// Path to write the reconstructed database to.
@@ -72,9 +79,10 @@ async fn main() {
         Command::Restore {
             txid,
             timestamp,
+            incremental,
             replica,
             out_path,
-        } => restore_cmd(txid, timestamp.as_deref(), &replica, &out_path).await,
+        } => restore_cmd(txid, timestamp.as_deref(), incremental, &replica, &out_path).await,
     }
 }
 
@@ -125,10 +133,23 @@ fn parse_timestamp_ms(s: &str) -> i64 {
 }
 
 /// Rebuilds the database from the replica and writes it to `out_path`. With
-/// `--txid`/`--timestamp` it reconstructs an earlier point in time; otherwise it
-/// streams the latest state straight to disk with bounded memory.
-async fn restore_cmd(txid: Option<u64>, timestamp: Option<&str>, replica: &str, out_path: &str) {
+/// `--txid`/`--timestamp` it reconstructs an earlier point in time; with
+/// `--incremental` it catches an existing copy up by the delta alone; otherwise
+/// it streams the latest state straight to disk with bounded memory.
+async fn restore_cmd(
+    txid: Option<u64>,
+    timestamp: Option<&str>,
+    incremental: bool,
+    replica: &str,
+    out_path: &str,
+) {
     let client = replica_client(replica);
+    if incremental {
+        let path = std::path::Path::new(out_path);
+        let outcome = catch_up(&client, path).await.expect("catch up");
+        eprintln!("{out_path}: {outcome}");
+        return;
+    }
     match (txid, timestamp) {
         (Some(txid), _) => {
             let result = restore_to_txid(&client, txid).await.expect("restore");

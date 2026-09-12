@@ -32,8 +32,8 @@ use bytes::Bytes;
 use crate::db::{CheckpointMode, CheckpointResult, Db};
 use crate::lock::ProcessLock;
 use crate::ltx::{
-    Checksum, Decoder, Encoder, HEADER_FLAG_NO_CHECKSUM, HEADER_SIZE, Header, INDEX_FOOTER_SIZE,
-    compact_to_writer, decode_page_frame, decode_page_index, lock_pgno, merge_to_writer, read_file,
+    Checksum, Decoder, Encoder, HEADER_FLAG_NO_CHECKSUM, Header, compact_to_writer, lock_pgno,
+    merge_to_writer,
 };
 use crate::storage::{LtxFileInfo, PutOutcome, ReplicaClient};
 use crate::wal::{
@@ -44,6 +44,7 @@ mod driver;
 mod error;
 mod level;
 mod reader;
+mod restore;
 mod retention;
 pub use driver::{
     DEFAULT_L0_RETENTION, DEFAULT_L0_RETENTION_CHECK_INTERVAL, DEFAULT_SNAPSHOT_INTERVAL,
@@ -52,6 +53,12 @@ pub use driver::{
 pub use error::SyncError;
 pub use level::{CompactionLevel, CompactionLevels, SNAPSHOT_LEVEL};
 pub use reader::ReplicaReader;
+// `mod restore` and `fn restore` coexist: modules live in the type namespace,
+// functions in the value namespace.
+pub use restore::{
+    CatchUp, FallbackReason, RestoreResult, catch_up, restore, restore_incremental,
+    restore_to_path, restore_to_timestamp, restore_to_txid,
+};
 
 /// Default WAL-frame growth before a checkpoint (~4 MB @ 4 KB), mirroring
 /// litestream's `DefaultMinCheckpointPageN`.
@@ -66,7 +73,7 @@ pub const DEFAULT_TRUNCATE_FRAMES: u64 = 121359;
 const LEVEL0: u32 = 0;
 /// Highest level scanned during restore/resume — covers litestream's levels 0–8
 /// plus the snapshot level 9 ([`SNAPSHOT_LEVEL`]).
-const MAX_LEVEL: u32 = 9;
+pub(super) const MAX_LEVEL: u32 = 9;
 
 /// What a [`Syncer::compact`] produced.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -833,7 +840,7 @@ impl Syncer {
             return Ok(None);
         }
 
-        let plan = plan_restore(&files)?;
+        let plan = restore::plan_restore(&files)?;
         let inputs = plan.len();
 
         // Fetch the plan files and stream-merge them into the snapshot, newest
@@ -1019,9 +1026,16 @@ fn now_ms() -> i64 {
 /// `<root>/<level:04x>/` before upload; the layout is local-only (the remote key
 /// layout is unchanged), so it's just a familiar, debuggable shape.
 fn staging_root(db_path: &Path) -> PathBuf {
+    litestream_dir(db_path).join("ltx")
+}
+
+/// literstream's sidecar directory for `db_path` — `<db>-litestream`. Holds the
+/// staging root (`ltx/`), compaction scratch (`compact/`), and the restore
+/// position marker (`RESTORED`, see [`restore`]).
+pub(super) fn litestream_dir(db_path: &Path) -> PathBuf {
     let mut p = db_path.to_path_buf().into_os_string();
     p.push("-litestream");
-    PathBuf::from(p).join("ltx")
+    PathBuf::from(p)
 }
 
 /// Sum of `.ltx` file sizes under a staging root — the un-uploaded backlog.
@@ -1046,7 +1060,7 @@ fn staged_backlog_bytes(staging: &Path) -> u64 {
 }
 
 /// Returns `path` with `suffix` appended to its file name (e.g. `x.ltx` → `x.ltx.tmp`).
-fn with_extension_suffix(path: &Path, suffix: &str) -> PathBuf {
+pub(super) fn with_extension_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut s = path.to_path_buf().into_os_string();
     s.push(suffix);
     PathBuf::from(s)
@@ -1180,17 +1194,6 @@ fn no_checksum_header(
     }
 }
 
-/// Lists every LTX file across all levels as `(level, min_txid, max_txid)`.
-async fn list_all_levels(client: &ReplicaClient) -> Result<Vec<(u32, u64, u64)>, SyncError> {
-    let mut files = Vec::new();
-    for level in 0..=MAX_LEVEL {
-        for f in client.list_ltx(level).await? {
-            files.push((level, f.min_txid, f.max_txid));
-        }
-    }
-    Ok(files)
-}
-
 /// Recovers the resume position from the replica. The TXID is the global maximum
 /// across all levels; the WAL offset/salts come from the newest **L0** file — the
 /// only level that carries live WAL state (compaction and snapshots zero those
@@ -1225,237 +1228,3 @@ async fn derive_position(files: &FileIndex, client: &ReplicaClient) -> Result<Po
     })
 }
 
-/// A greedy restore plan: starting from TXID 1, repeatedly pick the file that
-/// begins contiguously and reaches the furthest, preferring higher (compacted)
-/// levels on ties. This uses the fewest files to cover the whole range.
-fn plan_restore(files: &[(u32, u64, u64)]) -> Result<Vec<(u32, u64, u64)>, SyncError> {
-    let mut plan: Vec<(u32, u64, u64)> = Vec::new();
-    let mut pos: u64 = 0;
-    while let Some(&next) = files
-        .iter()
-        .filter(|(_, min, max)| *min <= pos + 1 && *max > pos)
-        .max_by(|a, b| a.2.cmp(&b.2).then(a.0.cmp(&b.0)))
-    {
-        pos = next.2;
-        plan.push(next);
-    }
-    if plan.first().map(|(_, min, _)| *min) != Some(1) {
-        return Err(SyncError::NoSnapshot);
-    }
-    Ok(plan)
-}
-
-/// A restore plan reaching as close to `target` as the available files allow,
-/// without overshooting it. Filtering to files ending at or before `target`
-/// before planning is what lets a fine-grained L0 file be used for an early
-/// point even when a later snapshot (whose range extends past `target`) exists.
-fn plan_restore_to(
-    files: &[(u32, u64, u64)],
-    target: u64,
-) -> Result<Vec<(u32, u64, u64)>, SyncError> {
-    let filtered: Vec<(u32, u64, u64)> = files
-        .iter()
-        .copied()
-        .filter(|(_, _, max)| *max <= target)
-        .collect();
-    plan_restore(&filtered)
-}
-
-/// A point-in-time restore result: the database image and the TXID it reflects
-/// (which may be earlier than requested if the exact point was compacted away).
-#[derive(Clone, Debug)]
-pub struct RestoreResult {
-    pub image: Vec<u8>,
-    pub txid: u64,
-}
-
-/// Applies a plan (files in TXID order) into a database image.
-async fn apply_plan(
-    client: &ReplicaClient,
-    plan: &[(u32, u64, u64)],
-) -> Result<Vec<u8>, SyncError> {
-    let mut image: Vec<u8> = Vec::new();
-    for &(level, min, max) in plan {
-        let bytes = client.get_ltx(level, min, max).await?;
-        let file = read_file(&bytes)?;
-        let page_size = file.header.page_size as usize;
-
-        image.resize(file.header.commit as usize * page_size, 0);
-        for (pgno, data) in file.pages {
-            let start = (pgno as usize - 1) * page_size;
-            image[start..start + page_size].copy_from_slice(&data);
-        }
-    }
-    Ok(image)
-}
-
-/// Reconstructs the latest database image from a replica's LTX chain.
-///
-/// Buffers the whole image in memory — convenient for tests and small
-/// databases. For anything large, prefer [`restore_to_path`], which streams to
-/// disk with O(page_size) resident memory.
-pub async fn restore(client: &ReplicaClient) -> Result<Vec<u8>, SyncError> {
-    let files = list_all_levels(client).await?;
-    let plan = plan_restore(&files)?;
-    apply_plan(client, &plan).await
-}
-
-/// Reconstructs the latest database image straight onto disk at `path`,
-/// returning the TXID it reflects.
-///
-/// Unlike [`restore`], the full image is never held in memory: pages are
-/// `pwrite`-n into a pre-sized file as they decode, so resident memory is
-/// O(page_size) plus a `commit`-bit "already written" set (≈ 32 KB per 1 GB of
-/// database). Files are applied newest-first — the first writer of each page
-/// wins — so each hot page is written exactly once, not once per file that
-/// touched it.
-pub async fn restore_to_path(client: &ReplicaClient, path: &Path) -> Result<u64, SyncError> {
-    let files = list_all_levels(client).await?;
-    let plan = plan_restore(&files)?;
-    apply_plan_to_path(client, &plan, path).await
-}
-
-/// Applies a restore plan (files in ascending TXID order) directly to a file,
-/// newest-first with a page-dedup set. Returns the restored TXID.
-async fn apply_plan_to_path(
-    client: &ReplicaClient,
-    plan: &[(u32, u64, u64)],
-    path: &Path,
-) -> Result<u64, SyncError> {
-    // The newest file fixes the final database size (a VACUUM may have shrunk it
-    // below what an older file carried). One ranged GET of its 100-byte header.
-    let &(nl, nmin, nmax) = plan.last().ok_or(SyncError::NoSnapshot)?;
-    let head = client
-        .get_ltx_range(nl, nmin, nmax, 0, HEADER_SIZE as u64)
-        .await?;
-    let nh = Header::decode(&head)?;
-    let page_size = nh.page_size as usize;
-    let commit = nh.commit as usize;
-
-    // Pre-size the output; `set_len` zero-fills, which also covers any gaps (the
-    // lock page in >1 GiB databases is never encoded and stays zero).
-    let out = File::create(path)?;
-    out.set_len((commit * page_size) as u64)?;
-
-    let lock = lock_pgno(nh.page_size) as usize;
-    let mut written = vec![false; commit + 1]; // 1-indexed; [0] unused.
-    if (1..=commit).contains(&lock) {
-        written[lock] = true; // Leave the lock page zero-filled.
-    }
-
-    // Newest-first: the first file (going backwards) to carry a page holds its
-    // latest version. Decode each file page-by-page from its index — never
-    // materializing a whole file's pages — and pwrite the ones we haven't
-    // written yet. Handles both the LZ4 block and frame (litestream) formats.
-    for &(level, min, max) in plan.iter().rev() {
-        let bytes = client.get_ltx(level, min, max).await?;
-        for_each_indexed_page(&bytes, page_size, |pgno, data| {
-            let p = pgno as usize;
-            if (1..=commit).contains(&p) && !written[p] {
-                written[p] = true;
-                out.write_all_at(data, ((p - 1) * page_size) as u64)?;
-            }
-            Ok(())
-        })?;
-    }
-    out.sync_all()?;
-    Ok(nmax)
-}
-
-/// Decodes an LTX file's pages one at a time via its page index, invoking `f`
-/// with each `(pgno, page_data)`. Only one decompressed page is resident at a
-/// time — unlike [`read_file`], which returns every page at once.
-fn for_each_indexed_page(
-    bytes: &[u8],
-    page_size: usize,
-    mut f: impl FnMut(u32, &[u8]) -> Result<(), SyncError>,
-) -> Result<(), SyncError> {
-    let footer = INDEX_FOOTER_SIZE as usize;
-    if bytes.len() < HEADER_SIZE + footer {
-        return Err(SyncError::Ltx(crate::ltx::LtxError::ShortBuffer {
-            need: HEADER_SIZE + footer,
-            got: bytes.len(),
-        }));
-    }
-    let index_size_at = bytes.len() - footer;
-    let index_len =
-        u64::from_be_bytes(bytes[index_size_at..index_size_at + 8].try_into().unwrap()) as usize;
-    let index_start = index_size_at - index_len;
-    let index = decode_page_index(&bytes[index_start..index_size_at])?;
-
-    for elem in &index {
-        let start = elem.offset as usize;
-        let end = start + elem.size as usize;
-        if end > bytes.len() {
-            return Err(SyncError::Ltx(crate::ltx::LtxError::ShortBuffer {
-                need: end,
-                got: bytes.len(),
-            }));
-        }
-        let (ph, data) = decode_page_frame(&bytes[start..end], page_size)?;
-        f(ph.pgno, &data)?;
-    }
-    Ok(())
-}
-
-/// Restores the database as of `target_txid` (point-in-time recovery).
-///
-/// Reconstructs the newest state whose TXID is at or before `target_txid`,
-/// preferring the finest-grained files available (so an exact synced TXID still
-/// in L0 restores exactly). If `target_txid` predates the oldest restorable
-/// point (e.g. it was compacted into a later snapshot and its L0 file was
-/// retention-pruned), returns [`SyncError::TxidTooOld`].
-pub async fn restore_to_txid(
-    client: &ReplicaClient,
-    target_txid: u64,
-) -> Result<RestoreResult, SyncError> {
-    let files = list_all_levels(client).await?;
-    let plan = match plan_restore_to(&files, target_txid) {
-        Ok(plan) => plan,
-        Err(SyncError::NoSnapshot) => {
-            return Err(SyncError::TxidTooOld {
-                requested: target_txid,
-            });
-        }
-        Err(e) => return Err(e),
-    };
-    let Some(&(_, _, txid)) = plan.last() else {
-        return Err(SyncError::TxidTooOld {
-            requested: target_txid,
-        });
-    };
-
-    let image = apply_plan(client, &plan).await?;
-    Ok(RestoreResult { image, txid })
-}
-
-/// Restores the database as of `timestamp_ms` (milliseconds since the Unix
-/// epoch), snapping to the newest transaction committed at or before it.
-pub async fn restore_to_timestamp(
-    client: &ReplicaClient,
-    timestamp_ms: i64,
-) -> Result<RestoreResult, SyncError> {
-    let files = list_all_levels(client).await?;
-
-    // The target TXID is the largest `max_txid` among all files whose header
-    // timestamp is at or before the requested time. Each file's timestamp
-    // reflects its newest content, so scanning every level (not just the latest
-    // restore plan) finds the finest boundary — a recent snapshot's timestamp
-    // won't hide the older L0/L1 files that carry earlier points.
-    let mut target_txid = 0;
-    for &(level, min, max) in &files {
-        if max <= target_txid {
-            continue;
-        }
-        let head = client
-            .get_ltx_range(level, min, max, 0, HEADER_SIZE as u64)
-            .await?;
-        if Header::decode(&head)?.timestamp <= timestamp_ms {
-            target_txid = max;
-        }
-    }
-    if target_txid == 0 {
-        return Err(SyncError::TxidTooOld { requested: 0 });
-    }
-    restore_to_txid(client, target_txid).await
-}
