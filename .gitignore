@@ -8,3 +8,4 @@ Cargo.lock
 !src/wal
 docker/garage/.garage.env
 .envrc
+plans
