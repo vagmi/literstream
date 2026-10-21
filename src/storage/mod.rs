@@ -248,6 +248,20 @@ impl ReplicaClient {
         out.sort_by_key(|f| (f.min_txid, f.max_txid));
         Ok(out)
     }
+
+    /// Every LTX file in levels `0..=max_level`, in level order and, within a
+    /// level, as [`list_ltx`](Self::list_ltx) sorts them.
+    ///
+    /// The levels are listed **concurrently**. Each is its own round trip, most
+    /// are empty, and against a remote bucket one costs a few hundred
+    /// milliseconds whether it finds anything or not — ten in a row was most of
+    /// the time it took to open an up-to-date replica.
+    pub async fn list_all_ltx(&self, max_level: u32) -> Result<Vec<LtxFileInfo>, StorageError> {
+        let levels =
+            futures::future::try_join_all((0..=max_level).map(|level| self.list_ltx(level)))
+                .await?;
+        Ok(levels.into_iter().flatten().collect())
+    }
 }
 
 /// Reads up to `buf.len()` bytes, filling `buf` fully unless EOF is reached
@@ -333,6 +347,27 @@ mod tests {
             "multipart upload round-trips byte-for-byte"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn list_all_returns_every_level_in_order() {
+        let client = ReplicaClient::new(Arc::new(InMemory::new()), "db");
+        for (level, min, max) in [(3, 1, 8), (0, 9, 9), (0, 10, 10), (1, 9, 10)] {
+            client
+                .put_ltx(level, min, max, Bytes::from_static(b"x"))
+                .await
+                .unwrap();
+        }
+        let got: Vec<(u32, u64, u64)> = client
+            .list_all_ltx(9)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|f| (f.level, f.min_txid, f.max_txid))
+            .collect();
+        assert_eq!(got, vec![(0, 9, 9), (0, 10, 10), (1, 9, 10), (3, 1, 8)]);
+        // Levels past the bound are not listed.
+        assert_eq!(client.list_all_ltx(2).await.unwrap().len(), 3);
     }
 
     #[tokio::test]

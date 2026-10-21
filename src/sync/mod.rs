@@ -219,10 +219,8 @@ impl Syncer {
         // list on open (to recover what the replica holds after a restart);
         // steady-state planning then reads the index, not the store.
         let mut files = FileIndex::default();
-        for level in 0..=MAX_LEVEL {
-            for f in client.list_ltx(level).await? {
-                files.insert(f);
-            }
+        for f in client.list_all_ltx(MAX_LEVEL).await? {
+            files.insert(f);
         }
         let pos = derive_position(&files, &client).await?;
         let mut db = db;

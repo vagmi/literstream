@@ -57,13 +57,12 @@ use super::{MAX_LEVEL, SyncError, litestream_dir, with_extension_suffix};
 pub(super) async fn list_all_levels(
     client: &ReplicaClient,
 ) -> Result<Vec<(u32, u64, u64)>, SyncError> {
-    let mut files = Vec::new();
-    for level in 0..=MAX_LEVEL {
-        for f in client.list_ltx(level).await? {
-            files.push((level, f.min_txid, f.max_txid));
-        }
-    }
-    Ok(files)
+    Ok(client
+        .list_all_ltx(MAX_LEVEL)
+        .await?
+        .into_iter()
+        .map(|f| (f.level, f.min_txid, f.max_txid))
+        .collect())
 }
 
 /// The greedy cover both planners share: starting at `from`, repeatedly pick the

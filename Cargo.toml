@@ -1,6 +1,6 @@
 [package]
 name = "literstream"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Continuously back up a live SQLite database to object storage; a Rust library port of Litestream"
 license = "MIT"
